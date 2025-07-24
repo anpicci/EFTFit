@@ -9,12 +9,14 @@
 # extend run time
 ulimit -s unlimited
 
+CARD_DIR="/scratch365/apiccine/xWynona/tau_john_cards_250714/ptz-lj0pt_withSys"
+
 # workspace naming
-WS_NAME="workspace.root"
+WS_NAME="${CARD_DIR}/workspace.root"
 
 # files input
-COM_CARD="combinedcard.txt"
-SCAL_DATA="scalings.json"
+COM_CARD="${CARD_DIR}/combinedcard.txt"
+SCAL_DATA="${CARD_DIR}/scalings.json"
 
 # physics model - interference model
 PHY_MODEL="HiggsAnalysis.CombinedLimit.InterferenceModels:interferenceModel"
