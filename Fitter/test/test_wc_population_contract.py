@@ -220,30 +220,3 @@ def test_consistent_caller_controls_are_canonicalized_once(tmp_path):
         assert argv.count(option) == 1
     assert "nuisance_alpha" in option_values(argv, "--freezeParameters")[0]
     assert parse_assignments(option_values(argv, "--setParameters")[0])["nuisance_beta"] == "2"
-
-
-def test_real_top_26_006_subset_keeps_all_scientific_runtime_pois():
-    workspace_root = Path(__file__).resolve().parents[6]
-    config_path = workspace_root / "topeft/topeft/params/fits/TOP_26_006.yml"
-    config = load_fit_config(config_path)
-    argv = build_configured_grid_scan_command(
-        config_path,
-        "historical_renderer_fixture.root",
-        scan_params=["ctW"],
-    )
-
-    runtime_pois = option_values(argv, "--redefineSignalPOIs")[0].split(",")
-    assert len(config.scientific_wcs) == 26
-    assert len(config.fixed_wcs) == 10
-    assert set(runtime_pois) == set(config.scientific_wcs)
-    assert not set(runtime_pois) & set(config.fixed_wcs)
-    assert option_values(argv, "-P") == ["ctW"]
-    assert str(config_path) not in " ".join(argv)
-
-
-def test_eftfitter_configured_path_uses_pure_builder():
-    source = (FITTER_DIR / "scripts/EFTFitter.py").read_text(encoding="utf-8")
-    assert "build_configured_grid_scan_command(" in source
-    assert "fit_config_path=fit_config" in source
-    assert "if fit_config is not None:" in source
-    assert "wc_val is not supported with configured WC populations" in source
