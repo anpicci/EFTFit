@@ -14,6 +14,7 @@ import uproot
 import numpy as np
 from collections import defaultdict
 from EFTFit.Fitter.findMask import findMask
+from EFTFit.Fitter.wc_fit_config import build_configured_grid_scan_command, load_fit_config, resolve_scan_wcs
 from itertools import chain
 from scipy.stats import chi2
 
@@ -423,7 +424,7 @@ class EFTFit(object):
         # Remove the temporary directory and split root files
         sp.call(['rm','-r',taskname+'tmp'])
 
-    def gridScan(self, name='.test', batch='', freeze=False, scan_params=['ctW','ctZ'], params_tracked=[], points=90000, other=[], mask=[], mask_syst=[], workspace='EFTWorkspace.root', track_error=False):
+    def gridScan(self, name='.test', batch='', freeze=False, scan_params=['ctW','ctZ'], params_tracked=[], points=90000, other=[], mask=[], mask_syst=[], workspace='EFTWorkspace.root', track_error=False, fit_config=None):
         ### Runs deltaNLL Scan in two parameters using CRAB or Condor ###
         logging.info("Doing grid scan...")
 
@@ -436,41 +437,71 @@ class EFTFit(object):
         if not os.path.exists(wsname):
             raise RuntimeError('Failed to find the workspace, either considering it as a local afs path or an absolute path. Please, fix it!')
         print('Workspace found! I am gonna use it for running fits...')
-        #args = ['combineTool.py','-d',wsname,'-M','MultiDimFit','--algo','grid','--cminPreScan','--cminDefaultMinimizerStrategy=0', '--freezeParameters', 'allConstrainedNuisances']
-        args = ['combineTool.py','-d',wsname,'-M','MultiDimFit','--algo','grid','--cminPreScan','--cminDefaultMinimizerStrategy=0']
-        args.extend(['--points','{}'.format(points)])
-        if name:              args.extend(['-n','{}'.format(name)])
-        if scan_params:     args.extend(['-P',' -P '.join(scan_params)]) # Preserves constraints
-        track = []
-        if any('trackParameters' in s for s in other):
-            index = other.index('--trackParameters')
-            other.pop(index)
-            track.append(other.pop(index))
+        if fit_config is not None:
+            configured_other = list(other)
+            if mask_syst:
+                configured_other.extend(['--freezeParameters', ','.join(mask_syst)])
+            if mask:
+                masks = []
+                for m in mask:
+                    msk = findMask(m)
+                    if not msk:
+                        print('No bins found containig ' + m + '! Please check the spelling, and try again.')
+                        return
+                    if 'sfz' not in m:
+                        msk = [x for x in msk if 'sfz' not in x]
+                    masks.append(msk)
+                configured_other.extend([
+                    '--setParameters',
+                    ','.join([item for sub in masks for item in sub]),
+                ])
+            args = build_configured_grid_scan_command(
+                fit_config_path=fit_config,
+                workspace=wsname,
+                name=name,
+                freeze=freeze,
+                scan_params=scan_params,
+                params_tracked=params_tracked,
+                points=points,
+                other=configured_other,
+                track_error=track_error,
+            )
+        else:
+            #args = ['combineTool.py','-d',wsname,'-M','MultiDimFit','--algo','grid','--cminPreScan','--cminDefaultMinimizerStrategy=0', '--freezeParameters', 'allConstrainedNuisances']
+            args = ['combineTool.py','-d',wsname,'-M','MultiDimFit','--algo','grid','--cminPreScan','--cminDefaultMinimizerStrategy=0']
+            args.extend(['--points','{}'.format(points)])
+            if name:              args.extend(['-n','{}'.format(name)])
+            if scan_params:     args.extend(['-P',' -P '.join(scan_params)]) # Preserves constraints
+            track = []
+            if any('trackParameters' in s for s in other):
+                index = other.index('--trackParameters')
+                other.pop(index)
+                track.append(other.pop(index))
 
-        if params_tracked: args.extend(['--trackParameters',','.join(params_tracked+track)])
-        if track_error: args.extend('--trackErrors rgx{.*}')
+            if params_tracked: args.extend(['--trackParameters',','.join(params_tracked+track)])
+            if track_error: args.extend('--trackErrors rgx{.*}')
 
-        if not freeze:        args.extend(['--floatOtherPOIs','1'])
-        params = ['{}=0'.format(wc) for wc in scan_params+params_tracked]
-        if '--setParameters' not in other: # Set all starting points to 0 unless the user specifies otherwise
-            other.append('--setParameters')
-            other.append(','.join(['{}=0'.format(wc) for wc in scan_params+params_tracked]))
-        if other:             args.extend(other)
-        if mask_syst:
-            freeze.append(','.join(mask_syst))
-        if mask:
-            masks = []
-            for m in mask:
-                msk = findMask(m)
-                if not msk:
-                    print('No bins found containig ' + m + '! Please check the spelling, and try again.')
-                    return
-                if 'sfz' not in m:
-                    msk = [x for x in msk if 'sfz' not in x]
-                masks.append(msk)
-            masks = [item for sub in masks for item in sub]
-            params += mask
-            args.extend(['--setParameters',','.join(masks)])
+            if not freeze:        args.extend(['--floatOtherPOIs','1'])
+            params = ['{}=0'.format(wc) for wc in scan_params+params_tracked]
+            if '--setParameters' not in other: # Set all starting points to 0 unless the user specifies otherwise
+                other.append('--setParameters')
+                other.append(','.join(['{}=0'.format(wc) for wc in scan_params+params_tracked]))
+            if other:             args.extend(other)
+            if mask_syst:
+                freeze.append(','.join(mask_syst))
+            if mask:
+                masks = []
+                for m in mask:
+                    msk = findMask(m)
+                    if not msk:
+                        print('No bins found containig ' + m + '! Please check the spelling, and try again.')
+                        return
+                    if 'sfz' not in m:
+                        msk = [x for x in msk if 'sfz' not in x]
+                    masks.append(msk)
+                masks = [item for sub in masks for item in sub]
+                params += mask
+                args.extend(['--setParameters',','.join(masks)])
 
         point_scale = 8#hrs
         wall_time  = 8#hrs
@@ -871,8 +902,45 @@ class EFTFit(object):
 
         return (graphwcs, graphnlls)
 
-    def batch1DScanEFT(self, basename='.test', batch='crab', freeze=False, scan_wcs=[], points=300, other=[], mask=[], mask_syst=[], workspace='EFTWorkspace.root', ignore=[], wc_ranges=None, wc_val=None):
+    def batch1DScanEFT(self, basename='.test', batch='crab', freeze=False, scan_wcs=[], points=300, other=[], mask=[], mask_syst=[], workspace='EFTWorkspace.root', ignore=[], wc_ranges=None, wc_val=None, fit_config=None):
         ### For each wc, run a 1D deltaNLL Scan.
+        if fit_config is not None:
+            config = load_fit_config(fit_config)
+            scan_wcs = list(resolve_scan_wcs(config, scan_wcs))
+            if ignore:
+                raise ValueError('ignore cannot override configured WC populations')
+            if wc_val is not None:
+                raise ValueError('wc_val is not supported with configured WC populations')
+
+            if wc_ranges is None: wc_ranges = self.wc_ranges_njets
+            if wc_ranges is True: wc_ranges = self.wc_ranges_differential
+            for wc in scan_wcs:
+                if isinstance(mask, list) and len(mask)==1:
+                    masks = mask[0]
+                else:
+                    masks = ','.join(mask)
+                configured_other = [
+                    '--setParameterRanges {}={},{}'.format(
+                        wc, wc_ranges[wc][0], wc_ranges[wc][1]
+                    )
+                ] + list(other)
+                if masks:
+                    configured_other.extend(['--setParameters', masks])
+                self.gridScan(
+                    '{}.{}'.format(basename, wc),
+                    batch,
+                    freeze,
+                    [wc],
+                    [configured_wc for configured_wc in config.scientific_wcs if configured_wc != wc],
+                    points,
+                    configured_other,
+                    [],
+                    mask_syst,
+                    workspace,
+                    fit_config=fit_config,
+                )
+            return
+
         if not scan_wcs:
             scan_wcs = self.wcs
         #else: self.wcs = scan_wcs
