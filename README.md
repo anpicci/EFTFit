@@ -125,6 +125,31 @@ Legacy tables remain for callers without a `fit_config`. Remove a legacy
 surface only after each affected consumer has an explicit successor or an
 evidence-backed intentional retirement.
 
+#### Condor 1D scan execution provenance
+
+`batch1DScanEFT` Condor submissions derive a job-set identity from the complete command
+after excluding only the Combine output label (`-n`) and scheduler task label
+(`--task-name`). The identity is embedded in both labels, so result filenames
+cannot be mistaken for outputs from another invocation with the same
+user-facing basename. The submission writes the machine-derived contract to
+`condor<scan_name>/execution_provenance.json`; this file is execution
+provenance, not a fit-configuration or physics authority.
+
+`batchRetrieve1DScansEFT` Condor retrieval requires that contract and the exact recorded `POINTS`
+members. Missing, unexpected, duplicate, stale, or inconsistent members stop
+retrieval before aggregation. Aggregation does not use `hadd -k`, publishes the
+combined file only after `hadd` succeeds, and removes only the recorded split
+outputs after success. Pre-provenance Condor job directories cannot establish
+complete membership and are intentionally refused by the 1D retrieval entry
+point rather than collected from a broad glob. Historical 2D/3D collection is
+unchanged and does not inherit this guarantee.
+
+CRAB keeps its historical submission, retrieval, and resubmission interfaces.
+Submission and resubmission now share the same task-label constructor, but the
+historical CRAB archives do not provide a repository-local exact expected-member
+contract. CRAB retrieval therefore does not carry the Condor completeness
+guarantee; it preserves extracted inputs when aggregation fails.
+
 #### Plot making
 
 To make simple 1D plots, use:
@@ -161,6 +186,13 @@ Run
 fitter.ImpactNuisance(workspace='ptz-lj0pt_fullR2_anatest17_noAutostats_withSys.root', wcs=[])
 ```
 to fit each NP. A blank `wcs` will run over all WCs.
+
+The impacts implementation currently retains historical internal WC lists and
+the maintained `self.systematics` nuisance list. These populations are not
+derived from the scan provenance contract. They must not be migrated to a
+different consumer or authority without exact identity-set evidence from the
+final maintained model; the execution-provenance changes above do not alter
+them.
 ### Produce plots
 Run 
 ```python3

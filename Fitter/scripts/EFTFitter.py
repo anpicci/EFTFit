@@ -10,6 +10,7 @@ import getpass
 import array
 import random
 import json
+import hashlib
 import uproot
 import numpy as np
 from collections import defaultdict
@@ -19,6 +20,225 @@ from itertools import chain
 from scipy.stats import chi2
 
 # Batch modes supported are: CRAB3 ('crab') and Condor ('condor')
+
+_execution_provenance_schema = 1
+_nonsemantic_identity_options = {'-n', '--task-name'}
+
+
+def _one_dimensional_scan_name(basename, wc):
+    return '{}.{}'.format(basename, wc)
+
+
+def _scheduler_task_label(name):
+    return name.replace('.', '')
+
+
+def _semantic_argv(argv):
+    semantic = []
+    index = 0
+    while index < len(argv):
+        if argv[index] in _nonsemantic_identity_options:
+            if index + 1 >= len(argv):
+                raise ValueError('{} requires a value'.format(argv[index]))
+            index += 2
+            continue
+        semantic.append(argv[index])
+        index += 1
+    return semantic
+
+
+def _replace_option_value(argv, option, value):
+    if option not in argv:
+        raise ValueError('{} is missing from the command'.format(option))
+    index = argv.index(option)
+    if index + 1 >= len(argv):
+        raise ValueError('{} requires a value'.format(option))
+    argv[index + 1] = value
+
+
+def _option_value(argv, option):
+    if argv.count(option) != 1:
+        raise ValueError('{} must occur exactly once'.format(option))
+    index = argv.index(option)
+    if index + 1 >= len(argv):
+        raise ValueError('{} requires a value'.format(option))
+    return argv[index + 1]
+
+
+def _job_set_identity(scan_name, semantic_argv):
+    identity_basis = {
+        'batch': 'condor',
+        'scan_name': scan_name,
+        'semantic_argv': semantic_argv,
+    }
+    serialized = json.dumps(
+        identity_basis,
+        sort_keys=True,
+        separators=(',', ':'),
+    )
+    return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
+
+
+def _expected_condor_outputs(output_label, points, split_points):
+    if points <= 0 or split_points <= 0:
+        raise ValueError('points and split_points must be positive')
+    return [
+        'higgsCombine{}.POINTS.{}.{}.MultiDimFit.mH120.root'.format(
+            output_label,
+            first_point,
+            min(first_point + split_points - 1, points - 1),
+        )
+        for first_point in range(0, points, split_points)
+    ]
+
+
+def _build_condor_provenance(scan_name, argv, points, split_points):
+    semantic = _semantic_argv(argv)
+    job_set_id = _job_set_identity(scan_name, semantic)
+    identity_token = job_set_id[:12]
+    output_label = '{}.job_{}'.format(scan_name, identity_token)
+    task_label = '{}_{}'.format(_scheduler_task_label(scan_name), identity_token)
+    execution_directory = 'condor{}'.format(scan_name)
+    return {
+        'schema': _execution_provenance_schema,
+        'batch': 'condor',
+        'scan_name': scan_name,
+        'job_set_id': job_set_id,
+        'identity_basis': {
+            'batch': 'condor',
+            'scan_name': scan_name,
+            'semantic_argv': semantic,
+        },
+        'command_argv': list(argv),
+        'points': points,
+        'split_points': split_points,
+        'output_label': output_label,
+        'scheduler_task_label': task_label,
+        'execution_directory': execution_directory,
+        'expected_outputs': _expected_condor_outputs(
+            output_label,
+            points,
+            split_points,
+        ),
+        'aggregate_output': '../fit_files/higgsCombine{}.MultiDimFit.root'.format(
+            scan_name
+        ),
+        'submission_artifacts': [
+            'condor_{}.sh'.format(task_label),
+            'condor_{}.sub'.format(task_label),
+        ],
+    }
+
+
+def _validate_condor_provenance(provenance, scan_name):
+    required_keys = {
+        'schema',
+        'batch',
+        'scan_name',
+        'job_set_id',
+        'identity_basis',
+        'command_argv',
+        'points',
+        'split_points',
+        'output_label',
+        'scheduler_task_label',
+        'execution_directory',
+        'expected_outputs',
+        'aggregate_output',
+        'submission_artifacts',
+    }
+    if set(provenance) != required_keys:
+        raise RuntimeError('Condor provenance has an unexpected schema')
+    if provenance['schema'] != _execution_provenance_schema:
+        raise RuntimeError('Condor provenance schema is not supported')
+    if provenance['batch'] != 'condor' or provenance['scan_name'] != scan_name:
+        raise RuntimeError('Condor provenance does not match the requested scan')
+
+    semantic = _semantic_argv(provenance['command_argv'])
+    expected_identity_basis = {
+        'batch': 'condor',
+        'scan_name': scan_name,
+        'semantic_argv': semantic,
+    }
+    if provenance['identity_basis'] != expected_identity_basis:
+        raise RuntimeError('Condor provenance identity basis is inconsistent')
+    job_set_id = _job_set_identity(scan_name, semantic)
+    if provenance['job_set_id'] != job_set_id:
+        raise RuntimeError('Condor provenance job identity is stale or mismatched')
+
+    identity_token = job_set_id[:12]
+    expected_output_label = '{}.job_{}'.format(scan_name, identity_token)
+    expected_task_label = '{}_{}'.format(
+        _scheduler_task_label(scan_name),
+        identity_token,
+    )
+    if provenance['output_label'] != expected_output_label:
+        raise RuntimeError('Condor provenance output identity is inconsistent')
+    if provenance['scheduler_task_label'] != expected_task_label:
+        raise RuntimeError('Condor provenance task identity is inconsistent')
+    if _option_value(provenance['command_argv'], '-n') != expected_output_label:
+        raise RuntimeError('Condor command output label is inconsistent')
+    if _option_value(provenance['command_argv'], '--task-name') != expected_task_label:
+        raise RuntimeError('Condor command task label is inconsistent')
+    if _option_value(semantic, '--job-mode') != 'condor':
+        raise RuntimeError('Condor provenance records a different job mode')
+    if _option_value(semantic, '--points') != str(provenance['points']):
+        raise RuntimeError('Condor provenance point count is inconsistent')
+    if _option_value(semantic, '--split-points') != str(provenance['split_points']):
+        raise RuntimeError('Condor provenance split size is inconsistent')
+
+    expected_directory = 'condor{}'.format(scan_name)
+    expected_outputs = _expected_condor_outputs(
+        expected_output_label,
+        provenance['points'],
+        provenance['split_points'],
+    )
+    expected_aggregate = '../fit_files/higgsCombine{}.MultiDimFit.root'.format(
+        scan_name
+    )
+    expected_artifacts = [
+        'condor_{}.sh'.format(expected_task_label),
+        'condor_{}.sub'.format(expected_task_label),
+    ]
+    if provenance['execution_directory'] != expected_directory:
+        raise RuntimeError('Condor provenance execution directory is inconsistent')
+    if provenance['expected_outputs'] != expected_outputs:
+        raise RuntimeError('Condor provenance expected outputs are inconsistent')
+    if provenance['aggregate_output'] != expected_aggregate:
+        raise RuntimeError('Condor provenance aggregate output is inconsistent')
+    if provenance['submission_artifacts'] != expected_artifacts:
+        raise RuntimeError('Condor provenance submission artifacts are inconsistent')
+    return provenance
+
+
+def _write_condor_provenance(provenance):
+    directory = provenance['execution_directory']
+    path = os.path.join(directory, 'execution_provenance.json')
+    temporary_path = path + '.tmp'
+    if os.path.exists(path) or os.path.exists(temporary_path):
+        raise RuntimeError('Condor provenance path already exists: {}'.format(path))
+    with open(temporary_path, 'x') as stream:
+        json.dump(provenance, stream, indent=2, sort_keys=True)
+        stream.write('\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary_path, path)
+    return path
+
+
+def _load_condor_provenance(scan_name):
+    path = os.path.join(
+        'condor{}'.format(scan_name),
+        'execution_provenance.json',
+    )
+    if not os.path.isfile(path):
+        raise RuntimeError(
+            'Missing Condor execution provenance for {}. Refusing partial or '
+            'legacy glob-only retrieval.'.format(scan_name)
+        )
+    with open(path, encoding='utf-8') as stream:
+        provenance = json.load(stream)
+    return _validate_condor_provenance(provenance, scan_name)
 
 class EFTFit(object):
     def __init__(self):
@@ -424,7 +644,7 @@ class EFTFit(object):
         # Remove the temporary directory and split root files
         sp.call(['rm','-r',taskname+'tmp'])
 
-    def gridScan(self, name='.test', batch='', freeze=False, scan_params=['ctW','ctZ'], params_tracked=[], points=90000, other=[], mask=[], mask_syst=[], workspace='EFTWorkspace.root', track_error=False, fit_config=None):
+    def gridScan(self, name='.test', batch='', freeze=False, scan_params=['ctW','ctZ'], params_tracked=[], points=90000, other=[], mask=[], mask_syst=[], workspace='EFTWorkspace.root', track_error=False, fit_config=None, execution_provenance=False):
         ### Runs deltaNLL Scan in two parameters using CRAB or Condor ###
         logging.info("Doing grid scan...")
 
@@ -506,10 +726,44 @@ class EFTFit(object):
         point_scale = 8#hrs
         wall_time  = 8#hrs
         if not freeze: wall_time /= 2 # profiled scans take longer, so submit less points per job
-        if batch=='crab':      args.extend(['--job-mode','crab3','--task-name',name.replace('.',''),'--custom-crab','custom_crab.py','--split-points',str(int(round(wall_time*point_scale)))])
-        if batch=='condor' and freeze==False and points>60000: args.extend(['--job-mode','condor','--task-name',name.replace('.',''),'--split-points','3000','--dry-run'])
-        elif batch=='condor' and freeze==False: args.extend(['--job-mode','condor','--task-name',name.replace('.',''),'--split-points','10','--dry-run'])
-        elif batch=='condor':          args.extend(['--job-mode','condor','--task-name',name.replace('.',''),'--split-points','10','--dry-run'])
+        condor_provenance = None
+        if batch=='crab':      args.extend(['--job-mode','crab3','--task-name',_scheduler_task_label(name),'--custom-crab','custom_crab.py','--split-points',str(int(round(wall_time*point_scale)))])
+        if batch=='condor' and freeze==False and points>60000: args.extend(['--job-mode','condor','--task-name',_scheduler_task_label(name),'--split-points','3000','--dry-run'])
+        elif batch=='condor' and freeze==False: args.extend(['--job-mode','condor','--task-name',_scheduler_task_label(name),'--split-points','10','--dry-run'])
+        elif batch=='condor':          args.extend(['--job-mode','condor','--task-name',_scheduler_task_label(name),'--split-points','10','--dry-run'])
+        if batch == 'condor' and execution_provenance:
+            split_points = int(_option_value(args, '--split-points'))
+            condor_provenance = _build_condor_provenance(
+                name,
+                args,
+                points,
+                split_points,
+            )
+            _replace_option_value(args, '-n', condor_provenance['output_label'])
+            _replace_option_value(
+                args,
+                '--task-name',
+                condor_provenance['scheduler_task_label'],
+            )
+            condor_provenance['command_argv'] = list(args)
+            _validate_condor_provenance(condor_provenance, name)
+            if os.path.exists(condor_provenance['execution_directory']):
+                raise RuntimeError(
+                    'Execution directory {} already exists'.format(
+                        condor_provenance['execution_directory']
+                    )
+                )
+            colliding_artifacts = [
+                path
+                for path in condor_provenance['submission_artifacts']
+                if os.path.exists(path)
+            ]
+            if colliding_artifacts:
+                raise RuntimeError(
+                    'Condor submission artifacts already exist: {}'.format(
+                        ','.join(colliding_artifacts)
+                    )
+                )
         logging.info(' '.join(args))
 
         # Run the combineTool.py command
@@ -518,11 +772,13 @@ class EFTFit(object):
         with process.stdout, process.stderr:
             self.log_subprocess_output(process.stdout, 'info')
             self.log_subprocess_output(process.stderr, 'err')
-        process.wait()
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError('CombineTool command failed with code {}'.format(return_code))
 
         # Condor needs executable permissions on the .sh file, so we used --dry-run
         # Add the permission and complete the submission.
-        if batch == 'condor':
+        if batch == 'condor' and condor_provenance is None:
             if os.path.exists('condor{}'.format(name)):
                 logging.error("Directory condor{} already exists!".format(name))
                 logging.error("Aborting submission.")
@@ -530,26 +786,63 @@ class EFTFit(object):
             sp.call(['mkdir', 'condor{}'.format(name)])
             sp.call(['chmod', 'a+x', 'condor_{}.sh'.format(name.replace('.', ''))])
             sp.call(['sed', '-i', 's/ulimit.*/&\\nunset PERL5LIB/', 'condor_{}.sh'.format(name.replace('.', ''))])
-            sp.call(['sed', '-i', 's/queue/\\n\\nrequestMemory=10000\\n+JobFlavour = "workday"\\n\\nqueue/', 'condor_{}.sub'.format(name.replace('.', ''))])  # Ask for at least 10GB of RAM
+            sp.call(['sed', '-i', 's/queue/\\n\\nrequestMemory=10000\\n+JobFlavour = "workday"\\n\\nqueue/', 'condor_{}.sub'.format(name.replace('.', ''))])
+            sp.call(['sed', '-i',
+                     's|executable = \\(.*\\)|executable = /users/ywan2/EFTFit_env14_2024/CMSSW_14_1_0_pre4/src/EFTFit/Fitter/test/condor_{}.sh\\narguments = $(ProcId)|'.format(name.replace('.', '')),
+                     'condor_{}.sub'.format(name.replace('.', ''))
+            ])
+            logging.info('Now submitting condor jobs.')
+            condorsub = sp.Popen(['condor_submit', '-append', 'initialdir=condor{}'.format(name), 'condor_{}.sub'.format(name.replace('.', ''))],
+                                 stdout=sp.PIPE, stderr=sp.PIPE)
+            with condorsub.stdout, condorsub.stderr:
+                self.log_subprocess_output(condorsub.stdout, 'info')
+                self.log_subprocess_output(condorsub.stderr, 'err')
+            condorsub.wait()
+            logging.info("Done with gridScan batch submission.")
+            return
+
+        if batch == 'condor':
+            os.mkdir(condor_provenance['execution_directory'])
+            shell_path, submit_path = condor_provenance['submission_artifacts']
+            setup_commands = [
+                ['chmod', 'a+x', shell_path],
+                ['sed', '-i', 's/ulimit.*/&\\nunset PERL5LIB/', shell_path],
+                ['sed', '-i', 's/queue/\\n\\nrequestMemory=10000\\n+JobFlavour = "workday"\\n\\nqueue/', submit_path],
+            ]
+            for command in setup_commands:
+                return_code = sp.call(command)
+                if return_code != 0:
+                    raise RuntimeError(
+                        'Condor setup command failed with code {}: {}'.format(
+                            return_code,
+                            ' '.join(command),
+                        )
+                    )
 
             # Replace hardcoded paths with $CMSSW_BASE and dynamic paths
             cmssw_base = os.getenv('CMSSW_BASE')
             test_dir = os.path.join(cmssw_base, 'src', 'EFTFit', 'Fitter', 'test')
 
-            sp.call(['sed', '-i',
-                     's|executable = \(.*\)|executable = /users/ywan2/EFTFit_env14_2024/CMSSW_14_1_0_pre4/src/EFTFit/Fitter/test/condor_{}.sh\\narguments = $(ProcId)|'.format(name.replace('.', '')),
-                     'condor_{}.sub'.format(name.replace('.', ''))
+            return_code = sp.call(['sed', '-i',
+                                   's|executable = \\(.*\\)|executable = /users/ywan2/EFTFit_env14_2024/CMSSW_14_1_0_pre4/src/EFTFit/Fitter/test/{}\\narguments = $(ProcId)|'.format(shell_path),
+                                   submit_path
             ])
+            if return_code != 0:
+                raise RuntimeError('Failed to update the Condor executable path')
+
+            _write_condor_provenance(condor_provenance)
             
             logging.info('Now submitting condor jobs.')
-            condorsub = sp.Popen(['condor_submit', '-append', 'initialdir=condor{}'.format(name), 'condor_{}.sub'.format(name.replace('.', ''))], 
+            condorsub = sp.Popen(['condor_submit', '-append', 'initialdir={}'.format(condor_provenance['execution_directory']), submit_path],
                                  stdout=sp.PIPE, stderr=sp.PIPE)
             #Maybe can be commented out
             with condorsub.stdout, condorsub.stderr:
                 self.log_subprocess_output(condorsub.stdout, 'info')
                 self.log_subprocess_output(condorsub.stderr, 'err')
 
-            condorsub.wait()
+            return_code = condorsub.wait()
+            if return_code != 0:
+                raise RuntimeError('Condor submission failed with code {}'.format(return_code))
 
         if batch:
             logging.info("Done with gridScan batch submission.")
@@ -627,9 +920,9 @@ class EFTFit(object):
         return ','.join(startValues)
 
 
-    def retrieveGridScan(self, name='.test', batch='crab', user='apiccine'):#getpass.getuser()):
+    def retrieveGridScan(self, name='.test', batch='crab', user='apiccine', require_condor_provenance=False):#getpass.getuser()):
         ### Retrieves finished grid jobs, extracts, and hadd's into a single file ###
-        taskname = name.replace('.','')
+        taskname = _scheduler_task_label(name)
         logging.info("Retrieving gridScan files. Task name: "+taskname)
 
         if batch=='crab':
@@ -663,29 +956,128 @@ class EFTFit(object):
             with process.stdout,process.stderr:
                 self.log_subprocess_output(process.stdout,'info')
                 self.log_subprocess_output(process.stderr,'err')
-            process.wait()
+            return_code = process.wait()
+            if return_code != 0:
+                raise RuntimeError(
+                    'CRAB aggregation failed with code {}; preserving extracted '
+                    'source evidence in {}'.format(return_code, taskname+'tmp')
+                )
 
             # Remove the temporary directory and split root files
             sp.call(['rm','-r',taskname+'tmp'])
             
         elif batch=='condor':
-            if not glob.glob('higgsCombine{}.POINTS*.root'.format(name)):
-                logging.info("No files to hadd. Returning.")
+            provenance_path = os.path.join(
+                'condor{}'.format(name),
+                'execution_provenance.json',
+            )
+            if not require_condor_provenance and not os.path.isfile(provenance_path):
+                legacy_outputs = sorted(
+                    glob.glob('higgsCombine{}.POINTS*.root'.format(name))
+                )
+                if not legacy_outputs:
+                    logging.info("No files to hadd. Returning.")
+                    return
+                haddargs = [
+                    'hadd',
+                    '-f',
+                    '-k',
+                    '../fit_files/higgsCombine'+name+'.MultiDimFit.root',
+                ] + legacy_outputs
+                print(([
+                    'hadd',
+                    '-f',
+                    '../../fit_files/higgsCombine'+name+'.MultiDimFit.root',
+                ] + legacy_outputs))
+                process = sp.Popen(haddargs, stdout=sp.PIPE, stderr=sp.PIPE)
+                with process.stdout,process.stderr:
+                    self.log_subprocess_output(process.stdout,'info')
+                    self.log_subprocess_output(process.stderr,'err')
+                process.wait()
+                for rootfile in legacy_outputs:
+                    os.remove(rootfile)
+                if os.path.isfile('condor_{}.sh'.format(name.replace('.',''))):
+                    os.rename('condor_{}.sh'.format(name.replace('.','')),'condor{0}/condor_{0}.sh'.format(name))
+                if os.path.isfile('condor_{}.sub'.format(name.replace('.',''))):
+                    os.rename('condor_{}.sub'.format(name.replace('.','')),'condor{0}/condor_{0}.sub'.format(name))
                 return
-            #haddargs = ['hadd','-f','higgsCombine'+name+'.MultiDimFit.root']+sorted(glob.glob('higgsCombine{}.POINTS*.root'.format(name)))
-            haddargs = ['hadd','-f','-k','../fit_files/higgsCombine'+name+'.MultiDimFit.root']+sorted(glob.glob('higgsCombine{}.POINTS*.root'.format(name)))
-            print((['hadd','-f','../../fit_files/higgsCombine'+name+'.MultiDimFit.root']+sorted(glob.glob('higgsCombine{}.POINTS*.root'.format(name)))))
+
+            provenance = _load_condor_provenance(name)
+            execution_directory = provenance['execution_directory']
+            expected_paths = [
+                os.path.join(execution_directory, output)
+                for output in provenance['expected_outputs']
+            ]
+            candidate_paths = sorted(
+                glob.glob(
+                    os.path.join(
+                        execution_directory,
+                        'higgsCombine{}.POINTS*.root'.format(
+                            provenance['output_label']
+                        ),
+                    )
+                )
+            )
+            missing_paths = sorted(set(expected_paths) - set(candidate_paths))
+            unexpected_paths = sorted(set(candidate_paths) - set(expected_paths))
+            if missing_paths or unexpected_paths:
+                raise RuntimeError(
+                    'Condor result membership is incomplete or ambiguous; '
+                    'missing=[{}], unexpected=[{}]'.format(
+                        ','.join(missing_paths),
+                        ','.join(unexpected_paths),
+                    )
+                )
+            file_identities = [
+                (os.stat(path).st_dev, os.stat(path).st_ino)
+                for path in expected_paths
+            ]
+            if len(file_identities) != len(set(file_identities)):
+                raise RuntimeError('Condor result membership contains duplicate files')
+
+            aggregate_output = provenance['aggregate_output']
+            temporary_output = '{}.{}.tmp'.format(
+                aggregate_output,
+                provenance['job_set_id'][:12],
+            )
+            if os.path.exists(temporary_output):
+                raise RuntimeError(
+                    'Temporary aggregate output already exists: {}'.format(
+                        temporary_output
+                    )
+                )
+            haddargs = ['hadd','-f',temporary_output]+expected_paths
+            print(haddargs)
             process = sp.Popen(haddargs, stdout=sp.PIPE, stderr=sp.PIPE)
             with process.stdout,process.stderr:
                 self.log_subprocess_output(process.stdout,'info')
                 self.log_subprocess_output(process.stderr,'err')
-            process.wait()
-            for rootfile in glob.glob('higgsCombine{}.POINTS*.root'.format(name)):
+            return_code = process.wait()
+            if return_code != 0:
+                raise RuntimeError(
+                    'Condor aggregation failed with code {}; preserving all '
+                    'source outputs'.format(return_code)
+                )
+            if not os.path.isfile(temporary_output):
+                raise RuntimeError(
+                    'Condor aggregation returned success without producing {}'.format(
+                        temporary_output
+                    )
+                )
+            os.replace(temporary_output, aggregate_output)
+
+            for artifact in provenance['submission_artifacts']:
+                if os.path.isfile(artifact):
+                    destination = os.path.join(execution_directory, artifact)
+                    if os.path.exists(destination):
+                        raise RuntimeError(
+                            'Condor artifact destination already exists: {}'.format(
+                                destination
+                            )
+                        )
+                    os.rename(artifact, destination)
+            for rootfile in expected_paths:
                 os.remove(rootfile)
-            if os.path.isfile('condor_{}.sh'.format(name.replace('.',''))):
-                os.rename('condor_{}.sh'.format(name.replace('.','')),'condor{0}/condor_{0}.sh'.format(name))
-            if os.path.isfile('condor_{}.sub'.format(name.replace('.',''))):
-                os.rename('condor_{}.sub'.format(name.replace('.','')),'condor{0}/condor_{0}.sub'.format(name))
 
     def submitEFTWilks(self, name='.test', limits='/users/b/byates2/Public/wc_top22006_a24_prof_2sigma.json', workspace='ptz-lj0pt_fullR2_anatest24v01_withAutostats_withSys.root', doBest=False, asimov=False, fixed=False, wc=None, sig=0, batch='condor'):
         '''
@@ -934,6 +1326,7 @@ class EFTFit(object):
                     mask_syst,
                     workspace,
                     fit_config=fit_config,
+                    execution_provenance=True,
                 )
             return
 
@@ -962,7 +1355,7 @@ class EFTFit(object):
             else:
                 masks = ','.join(mask)
             mask = []
-            self.gridScan('{}.{}'.format(basename,wc), batch, freeze, [wc], [wcs for wcs in self.wcs if wcs != wc], points, ['--setParameterRanges {}={},{}'.format(wc,wc_ranges[wc][0],wc_ranges[wc][1])]+zero_ignore+freeze_ignore+other+['--setParameters', params+','+masks], mask, mask_syst, workspace)
+            self.gridScan('{}.{}'.format(basename,wc), batch, freeze, [wc], [wcs for wcs in self.wcs if wcs != wc], points, ['--setParameterRanges {}={},{}'.format(wc,wc_ranges[wc][0],wc_ranges[wc][1])]+zero_ignore+freeze_ignore+other+['--setParameters', params+','+masks], mask, mask_syst, workspace, False, None, True)
 
     '''
     example: `fitter.batch2DScanEFT('.test.ctZ', batch='crab', wcs=['ctZ'], workspace='wps_njet_runII.root')`
@@ -1037,7 +1430,9 @@ class EFTFit(object):
             scan_wcs = self.wcs
 
         for wc in scan_wcs:
-            process = sp.Popen(['crab','resubmit','crab_'+basename.replace('.','')+wc], stdout=sp.PIPE, stderr=sp.PIPE)
+            scan_name = _one_dimensional_scan_name(basename, wc)
+            project_directory = 'crab_{}'.format(_scheduler_task_label(scan_name))
+            process = sp.Popen(['crab','resubmit',project_directory], stdout=sp.PIPE, stderr=sp.PIPE)
             with process.stdout,process.stderr:
                 self.log_subprocess_output(process.stdout,'info')
                 self.log_subprocess_output(process.stderr,'err')
@@ -1074,7 +1469,11 @@ class EFTFit(object):
             scan_wcs = self.wcs
 
         for wc in scan_wcs:
-            self.retrieveGridScan('{}.{}'.format(basename,wc),batch)
+            self.retrieveGridScan(
+                _one_dimensional_scan_name(basename,wc),
+                batch,
+                require_condor_provenance=(batch == 'condor'),
+            )
 
     def batchRetrieve2DScansEFT(self, basename='.EFT.gridScan', batch='crab', allPairs=False, wcs=[]):
         ### For pairs of wcs, retrieves finished grid jobs, extracts, and hadd's into a single file ###
