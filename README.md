@@ -132,12 +132,19 @@ evidence-backed intentional retirement.
 #### Condor 1D scan execution provenance
 
 `batch1DScanEFT` Condor submissions derive a job-set identity from the complete
-semantic command and the exact workspace bytes. Workspace identity records the
-requested and resolved paths, byte size, and SHA-256. Only the Combine output
-label (`-n`) and scheduler task label (`--task-name`) are excluded from semantic
-command identity. Every generated worker verifies the recorded workspace
-identity before its fit command; a missing or changed workspace stops the
-worker before Combine.
+statistical command and the exact workspace bytes. SHA-256 is the only
+workspace content identity. The requested and resolved workspace paths are
+runtime/provenance locators, and byte size is diagnostic metadata; none of
+those fields enters the job-set identity. The runtime command retains its
+actual `-d` locator, while the identity form replaces that local locator with a
+fixed token. The Combine output label (`-n`) and scheduler task label
+(`--task-name`) also remain outside statistical identity.
+
+Every generated worker checks the workspace SHA-256 as a top-level
+precondition before entering CombineTool's unchanged ProcId dispatcher. A
+missing or changed workspace stops the worker before Combine. Each successful
+dispatcher member then publishes only its exact expected `POINTS` output into the
+identity-scoped execution directory; retrieval reads that same location.
 
 The full identity is embedded in output labels and stored under
 `condor<scan_name>.job_<job_set_id>/`. That directory contains immutable
@@ -155,9 +162,13 @@ publishes an identity-bearing canonical file named
 `higgsCombine<scan_name>.job_<job_set_id>.MultiDimFit.root`, with an adjacent
 byte-bound provenance sidecar. Different identities coexist. Republishing the
 same identity is a verified no-op only when bytes agree; conflicting bytes fail
-closed. Pre-provenance Condor directories cannot establish complete membership
-and are intentionally refused by the maintained 1D entry point. Historical
-2D/3D collection is unchanged and does not inherit this guarantee.
+closed. The sidecar recomputes the job-set identity from the portable identity
+fields and validates the adjacent canonical aggregate by name, SHA-256, and
+size. It does not require the original workspace locator or publication
+directory to exist. Pre-provenance Condor directories cannot establish
+complete membership and are intentionally refused by the maintained 1D entry
+point. Historical 2D/3D collection is unchanged and does not inherit this
+guarantee.
 
 Maintained current 1D plotting paths resolve these canonical files directly.
 With no explicit identity, resolution succeeds only when exactly one validated

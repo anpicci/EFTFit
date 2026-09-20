@@ -52,10 +52,6 @@ make_workspace() {
     local target_basename
     local temporary_directory
     local temporary_workspace
-    local replacement_size
-    local replacement_sha256
-    local published_size
-    local published_sha256
     target_directory=$(dirname -- "$workspace_name") || return 1
     target_basename=$(basename -- "$workspace_name") || return 1
     if [ ! -d "$target_directory" ]; then
@@ -102,17 +98,6 @@ make_workspace() {
         rmdir -- "$temporary_directory"
         return 1
     fi
-    if ! replacement_size=$(stat -c %s -- "$temporary_workspace"); then
-        rm -f -- "$temporary_workspace"
-        rmdir -- "$temporary_directory"
-        return 1
-    fi
-    if ! replacement_sha256=$(sha256sum -- "$temporary_workspace" | awk '{print $1}'); then
-        rm -f -- "$temporary_workspace"
-        rmdir -- "$temporary_directory"
-        return 1
-    fi
-
     if [ "$overwrite" = yes ]; then
         if ! mv -f -- "$temporary_workspace" "$workspace_name"; then
             rm -f -- "$temporary_workspace"
@@ -130,14 +115,7 @@ make_workspace() {
     fi
     rmdir -- "$temporary_directory" || return 1
 
-    published_size=$(stat -c %s -- "$workspace_name") || return 1
-    published_sha256=$(sha256sum -- "$workspace_name" | awk '{print $1}') || return 1
-    if [ "$published_size" != "$replacement_size" ] || [ "$published_sha256" != "$replacement_sha256" ]; then
-        printf 'Published workspace failed size/SHA-256 readback.\n' >&2
-        return 1
-    fi
-    printf 'Published workspace resolved_path=%s size_bytes=%s sha256=%s\n' \
-        "$(readlink -f -- "$workspace_name")" "$published_size" "$published_sha256"
+    printf 'Published workspace: %s\n' "$workspace_name"
 }
 
 make_workspace "$@"

@@ -13,7 +13,6 @@ import getpass
 import array
 import random
 import json
-import hashlib
 import re
 import uproot
 import numpy as np
@@ -23,13 +22,16 @@ from EFTFit.Fitter.execution_provenance import (
     build_final_provenance,
     canonical_aggregate_path,
     canonical_json_bytes,
+    compute_job_set_id,
     file_identity,
     final_provenance_path,
+    identity_semantic_argv,
+    job_set_identity_basis,
     read_json,
     sha256_file,
     validate_final_provenance,
-    validate_workspace_identity,
     workspace_identity,
+    workspace_identity_schema,
     workspace_job_identity_basis,
     write_json_exclusive,
 )
@@ -39,7 +41,7 @@ from scipy.stats import chi2
 
 # Batch modes supported are: CRAB3 ('crab') and Condor ('condor')
 
-_execution_provenance_schema = 2
+_execution_provenance_schema = 3
 _nonsemantic_identity_options = {'-n', '--task-name'}
 
 
@@ -65,6 +67,11 @@ def _semantic_argv(argv):
     return semantic
 
 
+def _identity_semantic_argv(runtime_semantic_argv):
+    """Remove only the local workspace locator from statistical identity."""
+    return identity_semantic_argv(runtime_semantic_argv)
+
+
 def _replace_option_value(argv, option, value):
     if option not in argv:
         raise ValueError('{} is missing from the command'.format(option))
@@ -83,16 +90,13 @@ def _option_value(argv, option):
     return argv[index + 1]
 
 
-def _job_set_identity(scan_name, semantic_argv, recorded_workspace_identity):
-    identity_basis = {
-        'batch': 'condor',
-        'scan_name': scan_name,
-        'semantic_argv': semantic_argv,
-        'workspace_identity': workspace_job_identity_basis(
-            recorded_workspace_identity
-        ),
-    }
-    return hashlib.sha256(canonical_json_bytes(identity_basis)).hexdigest()
+def _job_set_identity(scan_name, identity_semantic_argv, recorded_workspace_identity):
+    return compute_job_set_id(
+        'condor',
+        scan_name,
+        identity_semantic_argv,
+        workspace_job_identity_basis(recorded_workspace_identity),
+    )
 
 
 def _expected_condor_members(output_label, points, split_points):
@@ -116,11 +120,14 @@ def _expected_condor_members(output_label, points, split_points):
 
 
 def _build_condor_provenance(scan_name, argv, points, split_points):
-    semantic = _semantic_argv(argv)
-    recorded_workspace_identity = workspace_identity(_option_value(semantic, '-d'))
+    runtime_semantic = _semantic_argv(argv)
+    identity_semantic = _identity_semantic_argv(runtime_semantic)
+    recorded_workspace_identity = workspace_identity(
+        _option_value(runtime_semantic, '-d')
+    )
     job_set_id = _job_set_identity(
         scan_name,
-        semantic,
+        identity_semantic,
         recorded_workspace_identity,
     )
     output_label = '{}.job_{}'.format(scan_name, job_set_id)
@@ -142,15 +149,14 @@ def _build_condor_provenance(scan_name, argv, points, split_points):
         'scan_name': scan_name,
         'job_set_id': job_set_id,
         'workspace_identity': recorded_workspace_identity,
-        'semantic_argv': semantic,
-        'identity_basis': {
-            'batch': 'condor',
-            'scan_name': scan_name,
-            'semantic_argv': semantic,
-            'workspace_identity': workspace_job_identity_basis(
-                recorded_workspace_identity
-            ),
-        },
+        'runtime_semantic_argv': runtime_semantic,
+        'identity_semantic_argv': identity_semantic,
+        'identity_basis': job_set_identity_basis(
+            'condor',
+            scan_name,
+            identity_semantic,
+            workspace_job_identity_basis(recorded_workspace_identity),
+        ),
         'command_argv': list(argv),
         'points': points,
         'split_points': split_points,
@@ -181,7 +187,8 @@ def _validate_condor_provenance(provenance, scan_name):
         'scan_name',
         'job_set_id',
         'workspace_identity',
-        'semantic_argv',
+        'runtime_semantic_argv',
+        'identity_semantic_argv',
         'identity_basis',
         'command_argv',
         'points',
@@ -204,22 +211,23 @@ def _validate_condor_provenance(provenance, scan_name):
     if provenance['batch'] != 'condor' or provenance['scan_name'] != scan_name:
         raise RuntimeError('Condor provenance does not match the requested scan')
 
-    semantic = _semantic_argv(provenance['command_argv'])
-    if provenance['semantic_argv'] != semantic:
-        raise RuntimeError('Condor provenance semantic argv is inconsistent')
-    expected_identity_basis = {
-        'batch': 'condor',
-        'scan_name': scan_name,
-        'semantic_argv': semantic,
-        'workspace_identity': workspace_job_identity_basis(
-            provenance['workspace_identity']
-        ),
-    }
+    runtime_semantic = _semantic_argv(provenance['command_argv'])
+    if provenance['runtime_semantic_argv'] != runtime_semantic:
+        raise RuntimeError('Condor provenance runtime semantic argv is inconsistent')
+    identity_semantic = _identity_semantic_argv(runtime_semantic)
+    if provenance['identity_semantic_argv'] != identity_semantic:
+        raise RuntimeError('Condor provenance identity semantic argv is inconsistent')
+    expected_identity_basis = job_set_identity_basis(
+        'condor',
+        scan_name,
+        identity_semantic,
+        workspace_job_identity_basis(provenance['workspace_identity']),
+    )
     if provenance['identity_basis'] != expected_identity_basis:
         raise RuntimeError('Condor provenance identity basis is inconsistent')
     job_set_id = _job_set_identity(
         scan_name,
-        semantic,
+        identity_semantic,
         provenance['workspace_identity'],
     )
     if provenance['job_set_id'] != job_set_id:
@@ -238,11 +246,11 @@ def _validate_condor_provenance(provenance, scan_name):
         raise RuntimeError('Condor command output label is inconsistent')
     if _option_value(provenance['command_argv'], '--task-name') != expected_task_label:
         raise RuntimeError('Condor command task label is inconsistent')
-    if _option_value(semantic, '--job-mode') != 'condor':
+    if _option_value(runtime_semantic, '--job-mode') != 'condor':
         raise RuntimeError('Condor provenance records a different job mode')
-    if _option_value(semantic, '--points') != str(provenance['points']):
+    if _option_value(runtime_semantic, '--points') != str(provenance['points']):
         raise RuntimeError('Condor provenance point count is inconsistent')
-    if _option_value(semantic, '--split-points') != str(provenance['split_points']):
+    if _option_value(runtime_semantic, '--split-points') != str(provenance['split_points']):
         raise RuntimeError('Condor provenance split size is inconsistent')
 
     expected_directory = 'condor{}.job_{}'.format(scan_name, job_set_id)
@@ -325,59 +333,93 @@ def _load_condor_provenance(scan_name, job_set_id=None):
 
 def _workspace_guard_lines(recorded_workspace_identity):
     workspace_path = shlex.quote(recorded_workspace_identity['requested_path'])
-    resolved_path = shlex.quote(recorded_workspace_identity['resolved_path'])
-    expected_size = str(recorded_workspace_identity['size_bytes'])
     expected_sha256 = shlex.quote(recorded_workspace_identity['sha256'])
     return [
         '# EFTFit content-bound workspace precondition\n',
         'unset PERL5LIB\n',
         'eftfit_workspace={}\n'.format(workspace_path),
-        'eftfit_expected_resolved={}\n'.format(resolved_path),
-        'eftfit_expected_size={}\n'.format(expected_size),
         'eftfit_expected_sha256={}\n'.format(expected_sha256),
-        'eftfit_actual_resolved=\n',
-        'eftfit_actual_size=\n',
         'eftfit_actual_sha256=\n',
         'if [ -f "$eftfit_workspace" ]; then\n',
-        '  eftfit_actual_resolved=$(readlink -f -- "$eftfit_workspace")\n',
-        '  eftfit_actual_size=$(wc -c < "$eftfit_workspace")\n',
         '  eftfit_actual_sha256=$(sha256sum -- "$eftfit_workspace" | awk \'{print $1}\')\n',
         'fi\n',
-        'if [ "$eftfit_actual_resolved" = "$eftfit_expected_resolved" ] && '
-        '[ "$eftfit_actual_size" = "$eftfit_expected_size" ] && '
-        '[ "$eftfit_actual_sha256" = "$eftfit_expected_sha256" ]; then\n',
-    ]
-
-
-def _install_workspace_guard(shell_path, recorded_workspace_identity):
-    with open(shell_path, encoding='utf-8') as stream:
-        lines = stream.readlines()
-    command_index = next(
-        (
-            index
-            for index, line in enumerate(lines)
-            if not line.lstrip().startswith('#')
-            and (
-                line.lstrip().startswith('combine ')
-                or line.lstrip().startswith('combineTool.py ')
-                or ' combine ' in line
-                or ' combineTool.py ' in line
-            )
-        ),
-        None,
-    )
-    if command_index is None:
-        raise RuntimeError('Generated Condor worker has no fit command to guard')
-    guarded_lines = lines[:command_index] + _workspace_guard_lines(
-        recorded_workspace_identity
-    )
-    guarded_lines.extend(lines[command_index:])
-    guarded_lines.extend([
-        'else\n',
+        'if [ "$eftfit_actual_sha256" != "$eftfit_expected_sha256" ]; then\n',
         '  printf "%s\\n" "Workspace content identity mismatch; refusing fit command" >&2\n',
         '  false\n',
         'fi\n',
-    ])
+    ]
+
+
+def _member_publication_lines(member, execution_directory):
+    source = shlex.quote(member['file_name'])
+    destination = shlex.quote(
+        os.path.join(execution_directory, member['file_name'])
+    )
+    return [
+        '# EFTFit exact logical-member publication\n',
+        'eftfit_member_source={}\n'.format(source),
+        'eftfit_member_destination={}\n'.format(destination),
+        'if [ ! -f "$eftfit_member_source" ] || [ -L "$eftfit_member_source" ] || [ ! -s "$eftfit_member_source" ]; then\n',
+        '  printf "%s\\n" "Expected logical member is missing or empty: $eftfit_member_source" >&2\n',
+        '  false\n',
+        'fi\n',
+        'if [ -e "$eftfit_member_destination" ] || [ -L "$eftfit_member_destination" ]; then\n',
+        '  printf "%s\\n" "Logical member destination already exists: $eftfit_member_destination" >&2\n',
+        '  false\n',
+        'fi\n',
+        'if ! ln -- "$eftfit_member_source" "$eftfit_member_destination"; then\n',
+        '  printf "%s\\n" "Failed to publish logical member without replacement: $eftfit_member_destination" >&2\n',
+        '  false\n',
+        'fi\n',
+        'rm -- "$eftfit_member_source"\n',
+    ]
+
+
+def _install_workspace_guard(
+    shell_path,
+    recorded_workspace_identity,
+    expected_members,
+    execution_directory,
+):
+    with open(shell_path, encoding='utf-8') as stream:
+        lines = stream.readlines()
+    command_indices = [
+        index
+        for index, line in enumerate(lines)
+        if not line.lstrip().startswith('#')
+        and (
+            line.lstrip().startswith('combine ')
+            or line.lstrip().startswith('combineTool.py ')
+            or ' combine ' in line
+            or ' combineTool.py ' in line
+        )
+    ]
+    if len(command_indices) != len(expected_members):
+        raise RuntimeError(
+            'Generated Condor worker command/member count is inconsistent'
+        )
+    dispatcher_index = next(
+        (
+            index
+            for index, line in enumerate(lines[: command_indices[0]])
+            if line.strip().startswith('if [ $1 -eq ')
+        ),
+        None,
+    )
+    if dispatcher_index is None:
+        raise RuntimeError('Generated Condor worker has no ProcId dispatcher')
+    guarded_lines = lines[:dispatcher_index]
+    guarded_lines.extend(_workspace_guard_lines(recorded_workspace_identity))
+    member_by_command_index = dict(zip(command_indices, expected_members))
+    for index, line in enumerate(lines[dispatcher_index:], start=dispatcher_index):
+        guarded_lines.append(line)
+        if index in member_by_command_index:
+            guarded_lines.extend(
+                _member_publication_lines(
+                    member_by_command_index[index],
+                    execution_directory,
+                )
+            )
     with open(shell_path, 'w', encoding='utf-8') as stream:
         stream.writelines(guarded_lines)
 
@@ -512,21 +554,24 @@ def _validate_attempt_record(provenance, path, expected_source_sha256):
     }
     if not set(serialized_members).issubset(expected_members):
         raise RuntimeError('Attempt record contains an unknown logical member')
-    provenance_path = os.path.join(
-        provenance['execution_directory'],
-        'execution_provenance.json',
-    )
-    if record['created_from'] != {
-        'path': os.path.realpath(provenance_path),
-        'sha256': expected_source_sha256,
-    }:
+    created_from = record['created_from']
+    if (
+        not isinstance(created_from, dict)
+        or set(created_from) != {'path', 'sha256'}
+        or not isinstance(created_from['path'], str)
+        or not created_from['path']
+        or created_from['sha256'] != expected_source_sha256
+    ):
         raise RuntimeError('Attempt record does not bind immutable job provenance')
     if (
         not isinstance(record['scheduler_artifacts'], list)
         or len(record['scheduler_artifacts']) != 2
-        or not all(os.path.isfile(path) for path in record['scheduler_artifacts'])
+        or not all(
+            isinstance(path, str) and path
+            for path in record['scheduler_artifacts']
+        )
     ):
-        raise RuntimeError('Attempt scheduler artifacts are missing or invalid')
+        raise RuntimeError('Attempt scheduler artifact references are invalid')
     return record
 
 
@@ -916,13 +961,13 @@ class EFTFit(object):
                 )
             replacement_identity = file_identity(temporary_output)
             os.replace(temporary_output, target)
-            published_identity = file_identity(target)
-            if (
-                published_identity['size_bytes'] != replacement_identity['size_bytes']
-                or published_identity['sha256'] != replacement_identity['sha256']
-            ):
-                raise RuntimeError('Published workspace failed byte-identity readback')
-            return workspace_identity(output)
+            return {
+                'schema': workspace_identity_schema,
+                'requested_path': os.fspath(output),
+                'resolved_path': os.path.realpath(target),
+                'size_bytes': replacement_identity['size_bytes'],
+                'sha256': replacement_identity['sha256'],
+            }
         finally:
             if os.path.exists(temporary_output):
                 os.unlink(temporary_output)
@@ -1161,17 +1206,6 @@ class EFTFit(object):
                         condor_provenance['execution_directory']
                     )
                 )
-            colliding_artifacts = [
-                path
-                for path in condor_provenance['generated_submission_artifacts']
-                if os.path.exists(path)
-            ]
-            if colliding_artifacts:
-                raise RuntimeError(
-                    'Condor submission artifacts already exist: {}'.format(
-                        ','.join(colliding_artifacts)
-                    )
-                )
         logging.info(' '.join(args))
 
         # Run the combineTool.py command
@@ -1215,7 +1249,6 @@ class EFTFit(object):
             ]
             if not os.path.isfile(generated_shell) or not os.path.isfile(generated_submit):
                 raise RuntimeError('CombineTool did not produce the recorded Condor artifacts')
-            validate_workspace_identity(condor_provenance['workspace_identity'])
             os.makedirs(condor_provenance['attempts_directory'])
             initial_scheduler_directory = os.path.join(
                 condor_provenance['scheduler_directory'],
@@ -1227,6 +1260,8 @@ class EFTFit(object):
             _install_workspace_guard(
                 generated_shell,
                 condor_provenance['workspace_identity'],
+                condor_provenance['expected_members'],
+                condor_provenance['execution_directory'],
             )
             shell_path, submit_path = condor_provenance['initial_scheduler_artifacts']
             _rewrite_submit_file(generated_submit, shell_path)
@@ -1345,7 +1380,6 @@ class EFTFit(object):
     def recoverGridScan(self, name, job_set_id=None):
         """Intentionally resubmit only unresolved members of one Condor job set."""
         provenance = _load_condor_provenance(name, job_set_id)
-        validate_workspace_identity(provenance['workspace_identity'])
         _, unresolved_members = _inspect_condor_members(provenance)
         if not unresolved_members:
             logging.info('No unresolved members for %s; recovery is a no-op.', name)

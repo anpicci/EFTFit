@@ -11,8 +11,10 @@ import tempfile
 
 
 workspace_identity_schema = 1
-final_aggregate_provenance_schema = 1
+final_aggregate_provenance_schema = 2
 _job_set_id_pattern = re.compile(r"[0-9a-f]{64}")
+_workspace_locator_options = {"-d", "--datacard"}
+workspace_identity_token = "<workspace_sha256>"
 
 
 def canonical_json_bytes(value):
@@ -56,13 +58,9 @@ def workspace_identity(requested_path):
 
 
 def workspace_job_identity_basis(identity):
-    """Return the content-bound workspace fields that participate in a job ID."""
+    """Return the sole workspace content-identity field used by a job ID."""
     _validate_workspace_identity_structure(identity)
-    return {
-        "resolved_path": identity["resolved_path"],
-        "size_bytes": identity["size_bytes"],
-        "sha256": identity["sha256"],
-    }
+    return identity["sha256"]
 
 
 def _validate_workspace_identity_structure(identity):
@@ -90,17 +88,70 @@ def _validate_workspace_identity_structure(identity):
 
 
 def validate_workspace_identity(expected_identity):
-    """Re-read a workspace and require exact agreement with its recorded identity."""
+    """Re-read the runtime workspace locator and require its recorded SHA-256."""
     _validate_workspace_identity_structure(expected_identity)
     observed = workspace_identity(expected_identity["requested_path"])
-    if observed != expected_identity:
+    if observed["sha256"] != expected_identity["sha256"]:
         raise RuntimeError(
-            "Workspace content identity mismatch: expected {}, observed {}".format(
-                json.dumps(expected_identity, sort_keys=True),
-                json.dumps(observed, sort_keys=True),
+            "Workspace content identity mismatch: expected sha256 {}, observed {}".format(
+                expected_identity["sha256"],
+                observed["sha256"],
             )
         )
     return observed
+
+
+def identity_semantic_argv(runtime_semantic_argv):
+    """Canonicalize only the local workspace locator out of runtime semantics."""
+    if not isinstance(runtime_semantic_argv, list) or not all(
+        isinstance(argument, str) for argument in runtime_semantic_argv
+    ):
+        raise RuntimeError("runtime_semantic_argv is invalid")
+    identity_semantic = list(runtime_semantic_argv)
+    locator_indices = [
+        index
+        for index, argument in enumerate(identity_semantic)
+        if argument in _workspace_locator_options
+    ]
+    if len(locator_indices) != 1:
+        raise RuntimeError("A workspace locator must occur exactly once")
+    locator_index = locator_indices[0]
+    if locator_index + 1 >= len(identity_semantic):
+        raise RuntimeError("{} requires a value".format(identity_semantic[locator_index]))
+    identity_semantic[locator_index + 1] = workspace_identity_token
+    return identity_semantic
+
+
+def job_set_identity_basis(batch, scan_name, identity_semantic_argv, workspace_sha256):
+    """Build the portable logical job identity basis."""
+    if batch != "condor":
+        raise RuntimeError("Job identity batch is not supported")
+    validate_scan_name(scan_name)
+    if not isinstance(identity_semantic_argv, list) or not all(
+        isinstance(argument, str) for argument in identity_semantic_argv
+    ):
+        raise RuntimeError("identity_semantic_argv is invalid")
+    if not isinstance(workspace_sha256, str) or not _job_set_id_pattern.fullmatch(
+        workspace_sha256
+    ):
+        raise RuntimeError("workspace_sha256 is invalid")
+    return {
+        "batch": batch,
+        "scan_name": scan_name,
+        "identity_semantic_argv": identity_semantic_argv,
+        "workspace_sha256": workspace_sha256,
+    }
+
+
+def compute_job_set_id(batch, scan_name, identity_semantic_argv, workspace_sha256):
+    """Return the SHA-256 identifier for one portable logical job basis."""
+    basis = job_set_identity_basis(
+        batch,
+        scan_name,
+        identity_semantic_argv,
+        workspace_sha256,
+    )
+    return hashlib.sha256(canonical_json_bytes(basis)).hexdigest()
 
 
 def validate_job_set_id(job_set_id):
@@ -171,7 +222,8 @@ def validate_execution_identity(provenance):
     required = {
         "batch",
         "scan_name",
-        "semantic_argv",
+        "runtime_semantic_argv",
+        "identity_semantic_argv",
         "workspace_identity",
     }
     if not isinstance(provenance, dict) or not required.issubset(provenance):
@@ -179,18 +231,25 @@ def validate_execution_identity(provenance):
     if provenance["batch"] != "condor":
         raise RuntimeError("Execution provenance is not for Condor")
     validate_scan_name(provenance["scan_name"])
-    if not isinstance(provenance["semantic_argv"], list):
-        raise RuntimeError("Execution semantic_argv is invalid")
+    if not isinstance(provenance["runtime_semantic_argv"], list):
+        raise RuntimeError("Execution runtime_semantic_argv is invalid")
+    if provenance["identity_semantic_argv"] != identity_semantic_argv(
+        provenance["runtime_semantic_argv"]
+    ):
+        raise RuntimeError("Execution identity semantic argv is inconsistent")
     _validate_workspace_identity_structure(provenance["workspace_identity"])
-    basis = {
-        "batch": provenance["batch"],
-        "scan_name": provenance["scan_name"],
-        "semantic_argv": provenance["semantic_argv"],
-        "workspace_identity": workspace_job_identity_basis(
-            provenance["workspace_identity"]
-        ),
-    }
-    observed_job_set_id = hashlib.sha256(canonical_json_bytes(basis)).hexdigest()
+    basis = job_set_identity_basis(
+        provenance["batch"],
+        provenance["scan_name"],
+        provenance["identity_semantic_argv"],
+        workspace_job_identity_basis(provenance["workspace_identity"]),
+    )
+    observed_job_set_id = compute_job_set_id(
+        provenance["batch"],
+        provenance["scan_name"],
+        provenance["identity_semantic_argv"],
+        workspace_job_identity_basis(provenance["workspace_identity"]),
+    )
     if provenance.get("identity_basis") != basis:
         raise RuntimeError("Execution provenance identity basis is inconsistent")
     if provenance.get("job_set_id") != observed_job_set_id:
@@ -210,17 +269,22 @@ def build_final_provenance(
     aggregate_identity = file_identity(canonical)
     return {
         "schema": final_aggregate_provenance_schema,
+        "batch": execution_provenance["batch"],
         "job_set_id": execution_provenance["job_set_id"],
         "scan_name": execution_provenance["scan_name"],
-        "workspace_identity": execution_provenance["workspace_identity"],
-        "semantic_argv": execution_provenance["semantic_argv"],
+        "workspace_sha256": workspace_job_identity_basis(
+            execution_provenance["workspace_identity"]
+        ),
+        "workspace_provenance": execution_provenance["workspace_identity"],
+        "runtime_semantic_argv": execution_provenance["runtime_semantic_argv"],
+        "identity_semantic_argv": execution_provenance["identity_semantic_argv"],
         "expected_members": execution_provenance["expected_members"],
         "attempt_history_references": attempt_history_references,
+        "canonical_aggregate_name": os.path.basename(canonical),
         "canonical_aggregate_path": canonical,
         "canonical_aggregate_size": aggregate_identity["size_bytes"],
         "canonical_aggregate_sha256": aggregate_identity["sha256"],
         "publication_state": publication_state,
-        "publication_readback": aggregate_identity,
     }
 
 
@@ -230,17 +294,20 @@ def validate_final_provenance(provenance_path_value, expected_scan_name=None, ex
     provenance = read_json(provenance_path_value)
     required_keys = {
         "schema",
+        "batch",
         "job_set_id",
         "scan_name",
-        "workspace_identity",
-        "semantic_argv",
+        "workspace_sha256",
+        "workspace_provenance",
+        "runtime_semantic_argv",
+        "identity_semantic_argv",
         "expected_members",
         "attempt_history_references",
+        "canonical_aggregate_name",
         "canonical_aggregate_path",
         "canonical_aggregate_size",
         "canonical_aggregate_sha256",
         "publication_state",
-        "publication_readback",
     }
     if not isinstance(provenance, dict) or set(provenance) != required_keys:
         raise RuntimeError("Final aggregate provenance has an unexpected schema")
@@ -248,32 +315,53 @@ def validate_final_provenance(provenance_path_value, expected_scan_name=None, ex
         raise RuntimeError("Final aggregate provenance schema is not supported")
     validate_scan_name(provenance["scan_name"])
     validate_job_set_id(provenance["job_set_id"])
-    _validate_workspace_identity_structure(provenance["workspace_identity"])
+    _validate_workspace_identity_structure(provenance["workspace_provenance"])
+    if (
+        provenance["workspace_sha256"]
+        != workspace_job_identity_basis(provenance["workspace_provenance"])
+    ):
+        raise RuntimeError("Final aggregate workspace provenance is inconsistent")
+    if provenance["identity_semantic_argv"] != identity_semantic_argv(
+        provenance["runtime_semantic_argv"]
+    ):
+        raise RuntimeError("Final aggregate identity semantic argv is inconsistent")
+    observed_job_set_id = compute_job_set_id(
+        provenance["batch"],
+        provenance["scan_name"],
+        provenance["identity_semantic_argv"],
+        provenance["workspace_sha256"],
+    )
+    if provenance["job_set_id"] != observed_job_set_id:
+        raise RuntimeError("Final aggregate job_set_id is inconsistent")
     if expected_scan_name is not None and provenance["scan_name"] != expected_scan_name:
         raise RuntimeError("Final aggregate provenance has the wrong scan_name")
     if expected_job_set_id is not None and provenance["job_set_id"] != expected_job_set_id:
         raise RuntimeError("Final aggregate provenance has the wrong job_set_id")
-    canonical_path_value = provenance["canonical_aggregate_path"]
     expected_name = canonical_aggregate_name(
         provenance["scan_name"], provenance["job_set_id"]
     )
-    if os.path.basename(canonical_path_value) != expected_name:
+    if provenance["canonical_aggregate_name"] != expected_name:
+        raise RuntimeError("Canonical aggregate name identity is inconsistent")
+    if os.path.basename(provenance["canonical_aggregate_path"]) != expected_name:
         raise RuntimeError("Canonical aggregate filename identity is inconsistent")
-    if os.path.realpath(canonical_path_value) != canonical_path_value:
-        raise RuntimeError("Canonical aggregate provenance path is not resolved")
-    if os.path.realpath(final_provenance_path(canonical_path_value)) != os.path.realpath(
-        provenance_path_value
-    ):
+    sidecar_suffix = ".provenance.json"
+    if not provenance_path_value.endswith(sidecar_suffix):
+        raise RuntimeError("Final aggregate sidecar has an unexpected name")
+    canonical_path_value = provenance_path_value[: -len(sidecar_suffix)]
+    if os.path.basename(canonical_path_value) != expected_name:
         raise RuntimeError("Final aggregate sidecar is not adjacent to its canonical file")
     observed = file_identity(canonical_path_value)
     expected_identity = {
-        "resolved_path": canonical_path_value,
         "size_bytes": provenance["canonical_aggregate_size"],
         "sha256": provenance["canonical_aggregate_sha256"],
     }
-    if observed != expected_identity or provenance["publication_readback"] != observed:
+    observed_identity = {
+        "size_bytes": observed["size_bytes"],
+        "sha256": observed["sha256"],
+    }
+    if observed_identity != expected_identity:
         raise RuntimeError("Canonical aggregate bytes do not match final provenance")
-    return canonical_path_value
+    return observed["resolved_path"]
 
 
 def _candidate_job_set_id(filename, scan_name):

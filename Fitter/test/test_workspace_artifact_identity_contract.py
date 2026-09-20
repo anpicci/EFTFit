@@ -1,8 +1,8 @@
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -17,7 +17,7 @@ import execution_provenance as provenance
 
 def execution_provenance(workspace, scan_name=".artifact.c_one"):
     workspace_record = provenance.workspace_identity(workspace)
-    semantic_argv = [
+    runtime_semantic_argv = [
         "combineTool.py",
         "-d",
         str(workspace),
@@ -26,17 +26,25 @@ def execution_provenance(workspace, scan_name=".artifact.c_one"):
         "--algo",
         "grid",
     ]
-    basis = {
-        "batch": "condor",
-        "scan_name": scan_name,
-        "semantic_argv": semantic_argv,
-        "workspace_identity": provenance.workspace_job_identity_basis(workspace_record),
-    }
-    job_set_id = hashlib.sha256(provenance.canonical_json_bytes(basis)).hexdigest()
+    identity_semantic_argv = list(runtime_semantic_argv)
+    identity_semantic_argv[2] = "<workspace_sha256>"
+    basis = provenance.job_set_identity_basis(
+        "condor",
+        scan_name,
+        identity_semantic_argv,
+        workspace_record["sha256"],
+    )
+    job_set_id = provenance.compute_job_set_id(
+        "condor",
+        scan_name,
+        identity_semantic_argv,
+        workspace_record["sha256"],
+    )
     return {
         "batch": "condor",
         "scan_name": scan_name,
-        "semantic_argv": semantic_argv,
+        "runtime_semantic_argv": runtime_semantic_argv,
+        "identity_semantic_argv": identity_semantic_argv,
         "workspace_identity": workspace_record,
         "identity_basis": basis,
         "job_set_id": job_set_id,
@@ -77,6 +85,23 @@ def test_workspace_identity_is_deterministic_and_content_bound(tmp_path):
     assert second["sha256"] != first["sha256"]
     with pytest.raises(RuntimeError, match="identity mismatch"):
         provenance.validate_workspace_identity(first)
+
+
+def test_workspace_job_identity_is_sha_only_and_path_independent(tmp_path):
+    first_path = tmp_path / "first" / "workspace.root"
+    second_path = tmp_path / "second" / "workspace.root"
+    first_path.parent.mkdir()
+    second_path.parent.mkdir()
+    first_path.write_bytes(b"same workspace bytes")
+    second_path.write_bytes(first_path.read_bytes())
+    first = execution_provenance(first_path)
+    second = execution_provenance(second_path)
+    assert first["runtime_semantic_argv"] != second["runtime_semantic_argv"]
+    assert first["identity_semantic_argv"] == second["identity_semantic_argv"]
+    assert first["job_set_id"] == second["job_set_id"]
+    second_path.write_bytes(b"different workspace bytes")
+    changed = execution_provenance(second_path)
+    assert changed["job_set_id"] != second["job_set_id"]
 
 
 def test_resolver_zero_one_multiple_and_explicit_identity(tmp_path):
@@ -120,6 +145,44 @@ def test_resolver_rejects_stale_manifest(tmp_path):
         provenance.resolve_canonical_aggregate(
             execution["scan_name"], execution["job_set_id"], fit_directory
         )
+
+
+def test_final_provenance_recomputes_job_identity(tmp_path):
+    fit_directory = tmp_path / "fit_files"
+    fit_directory.mkdir()
+    workspace = tmp_path / "workspace.root"
+    workspace.write_bytes(b"workspace")
+    execution = execution_provenance(workspace)
+    canonical = publish_synthetic(fit_directory, execution)
+    sidecar = Path(provenance.final_provenance_path(canonical))
+    record = json.loads(sidecar.read_text(encoding="utf-8"))
+    record["runtime_semantic_argv"][-1] = "different_algorithm"
+    record["identity_semantic_argv"][-1] = "different_algorithm"
+    sidecar.write_text(json.dumps(record), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="job_set_id is inconsistent"):
+        provenance.validate_final_provenance(sidecar)
+
+
+def test_final_provenance_validates_after_package_relocation_without_workspace(
+    tmp_path,
+):
+    original_directory = tmp_path / "original" / "fit_files"
+    relocated_directory = tmp_path / "relocated" / "fit_files"
+    original_directory.mkdir(parents=True)
+    relocated_directory.mkdir(parents=True)
+    workspace = tmp_path / "original" / "workspace.root"
+    workspace.write_bytes(b"workspace")
+    execution = execution_provenance(workspace)
+    canonical = publish_synthetic(original_directory, execution)
+    sidecar = Path(provenance.final_provenance_path(canonical))
+    relocated_canonical = relocated_directory / canonical.name
+    relocated_sidecar = Path(provenance.final_provenance_path(relocated_canonical))
+    shutil.copy2(canonical, relocated_canonical)
+    shutil.copy2(sidecar, relocated_sidecar)
+    workspace.unlink()
+    assert provenance.validate_final_provenance(relocated_sidecar) == str(
+        relocated_canonical.resolve()
+    )
 
 
 def test_transient_alias_is_relative_locked_and_context_bounded(tmp_path):
