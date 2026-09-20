@@ -3,6 +3,9 @@ import stat
 import sys
 import logging
 import subprocess as sp
+import shutil
+import shlex
+import tempfile
 import ROOT
 import itertools
 import glob
@@ -11,17 +14,32 @@ import array
 import random
 import json
 import hashlib
+import re
 import uproot
 import numpy as np
 from collections import defaultdict
 from EFTFit.Fitter.findMask import findMask
+from EFTFit.Fitter.execution_provenance import (
+    build_final_provenance,
+    canonical_aggregate_path,
+    canonical_json_bytes,
+    file_identity,
+    final_provenance_path,
+    read_json,
+    sha256_file,
+    validate_final_provenance,
+    validate_workspace_identity,
+    workspace_identity,
+    workspace_job_identity_basis,
+    write_json_exclusive,
+)
 from EFTFit.Fitter.wc_fit_config import build_configured_grid_scan_command, load_fit_config, resolve_scan_wcs
 from itertools import chain
 from scipy.stats import chi2
 
 # Batch modes supported are: CRAB3 ('crab') and Condor ('condor')
 
-_execution_provenance_schema = 1
+_execution_provenance_schema = 2
 _nonsemantic_identity_options = {'-n', '--task-name'}
 
 
@@ -65,49 +83,73 @@ def _option_value(argv, option):
     return argv[index + 1]
 
 
-def _job_set_identity(scan_name, semantic_argv):
+def _job_set_identity(scan_name, semantic_argv, recorded_workspace_identity):
     identity_basis = {
         'batch': 'condor',
         'scan_name': scan_name,
         'semantic_argv': semantic_argv,
+        'workspace_identity': workspace_job_identity_basis(
+            recorded_workspace_identity
+        ),
     }
-    serialized = json.dumps(
-        identity_basis,
-        sort_keys=True,
-        separators=(',', ':'),
-    )
-    return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
+    return hashlib.sha256(canonical_json_bytes(identity_basis)).hexdigest()
 
 
-def _expected_condor_outputs(output_label, points, split_points):
+def _expected_condor_members(output_label, points, split_points):
     if points <= 0 or split_points <= 0:
         raise ValueError('points and split_points must be positive')
     return [
-        'higgsCombine{}.POINTS.{}.{}.MultiDimFit.mH120.root'.format(
-            output_label,
-            first_point,
-            min(first_point + split_points - 1, points - 1),
-        )
-        for first_point in range(0, points, split_points)
+        {
+            'member_index': member_index,
+            'first_point': first_point,
+            'last_point': min(first_point + split_points - 1, points - 1),
+            'file_name': (
+                'higgsCombine{}.POINTS.{}.{}.MultiDimFit.mH120.root'.format(
+                    output_label,
+                    first_point,
+                    min(first_point + split_points - 1, points - 1),
+                )
+            ),
+        }
+        for member_index, first_point in enumerate(range(0, points, split_points))
     ]
 
 
 def _build_condor_provenance(scan_name, argv, points, split_points):
     semantic = _semantic_argv(argv)
-    job_set_id = _job_set_identity(scan_name, semantic)
-    identity_token = job_set_id[:12]
-    output_label = '{}.job_{}'.format(scan_name, identity_token)
-    task_label = '{}_{}'.format(_scheduler_task_label(scan_name), identity_token)
-    execution_directory = 'condor{}'.format(scan_name)
+    recorded_workspace_identity = workspace_identity(_option_value(semantic, '-d'))
+    job_set_id = _job_set_identity(
+        scan_name,
+        semantic,
+        recorded_workspace_identity,
+    )
+    output_label = '{}.job_{}'.format(scan_name, job_set_id)
+    task_label = '{}_{}'.format(_scheduler_task_label(scan_name), job_set_id)
+    execution_directory = 'condor{}.job_{}'.format(scan_name, job_set_id)
+    generated_artifacts = [
+        'condor_{}.sh'.format(task_label),
+        'condor_{}.sub'.format(task_label),
+    ]
+    initial_scheduler_directory = os.path.join(
+        execution_directory,
+        'scheduler',
+        'attempt_0001',
+    )
+    aggregate_output = canonical_aggregate_path(scan_name, job_set_id)
     return {
         'schema': _execution_provenance_schema,
         'batch': 'condor',
         'scan_name': scan_name,
         'job_set_id': job_set_id,
+        'workspace_identity': recorded_workspace_identity,
+        'semantic_argv': semantic,
         'identity_basis': {
             'batch': 'condor',
             'scan_name': scan_name,
             'semantic_argv': semantic,
+            'workspace_identity': workspace_job_identity_basis(
+                recorded_workspace_identity
+            ),
         },
         'command_argv': list(argv),
         'points': points,
@@ -115,17 +157,19 @@ def _build_condor_provenance(scan_name, argv, points, split_points):
         'output_label': output_label,
         'scheduler_task_label': task_label,
         'execution_directory': execution_directory,
-        'expected_outputs': _expected_condor_outputs(
+        'expected_members': _expected_condor_members(
             output_label,
             points,
             split_points,
         ),
-        'aggregate_output': '../fit_files/higgsCombine{}.MultiDimFit.root'.format(
-            scan_name
-        ),
-        'submission_artifacts': [
-            'condor_{}.sh'.format(task_label),
-            'condor_{}.sub'.format(task_label),
+        'attempts_directory': os.path.join(execution_directory, 'attempts'),
+        'scheduler_directory': os.path.join(execution_directory, 'scheduler'),
+        'aggregate_output': aggregate_output,
+        'final_provenance': final_provenance_path(aggregate_output),
+        'generated_submission_artifacts': generated_artifacts,
+        'initial_scheduler_artifacts': [
+            os.path.join(initial_scheduler_directory, generated_artifacts[0]),
+            os.path.join(initial_scheduler_directory, generated_artifacts[1]),
         ],
     }
 
@@ -136,6 +180,8 @@ def _validate_condor_provenance(provenance, scan_name):
         'batch',
         'scan_name',
         'job_set_id',
+        'workspace_identity',
+        'semantic_argv',
         'identity_basis',
         'command_argv',
         'points',
@@ -143,9 +189,13 @@ def _validate_condor_provenance(provenance, scan_name):
         'output_label',
         'scheduler_task_label',
         'execution_directory',
-        'expected_outputs',
+        'expected_members',
+        'attempts_directory',
+        'scheduler_directory',
         'aggregate_output',
-        'submission_artifacts',
+        'final_provenance',
+        'generated_submission_artifacts',
+        'initial_scheduler_artifacts',
     }
     if set(provenance) != required_keys:
         raise RuntimeError('Condor provenance has an unexpected schema')
@@ -155,22 +205,30 @@ def _validate_condor_provenance(provenance, scan_name):
         raise RuntimeError('Condor provenance does not match the requested scan')
 
     semantic = _semantic_argv(provenance['command_argv'])
+    if provenance['semantic_argv'] != semantic:
+        raise RuntimeError('Condor provenance semantic argv is inconsistent')
     expected_identity_basis = {
         'batch': 'condor',
         'scan_name': scan_name,
         'semantic_argv': semantic,
+        'workspace_identity': workspace_job_identity_basis(
+            provenance['workspace_identity']
+        ),
     }
     if provenance['identity_basis'] != expected_identity_basis:
         raise RuntimeError('Condor provenance identity basis is inconsistent')
-    job_set_id = _job_set_identity(scan_name, semantic)
+    job_set_id = _job_set_identity(
+        scan_name,
+        semantic,
+        provenance['workspace_identity'],
+    )
     if provenance['job_set_id'] != job_set_id:
         raise RuntimeError('Condor provenance job identity is stale or mismatched')
 
-    identity_token = job_set_id[:12]
-    expected_output_label = '{}.job_{}'.format(scan_name, identity_token)
+    expected_output_label = '{}.job_{}'.format(scan_name, job_set_id)
     expected_task_label = '{}_{}'.format(
         _scheduler_task_label(scan_name),
-        identity_token,
+        job_set_id,
     )
     if provenance['output_label'] != expected_output_label:
         raise RuntimeError('Condor provenance output identity is inconsistent')
@@ -187,58 +245,346 @@ def _validate_condor_provenance(provenance, scan_name):
     if _option_value(semantic, '--split-points') != str(provenance['split_points']):
         raise RuntimeError('Condor provenance split size is inconsistent')
 
-    expected_directory = 'condor{}'.format(scan_name)
-    expected_outputs = _expected_condor_outputs(
+    expected_directory = 'condor{}.job_{}'.format(scan_name, job_set_id)
+    expected_members = _expected_condor_members(
         expected_output_label,
         provenance['points'],
         provenance['split_points'],
     )
-    expected_aggregate = '../fit_files/higgsCombine{}.MultiDimFit.root'.format(
-        scan_name
-    )
-    expected_artifacts = [
+    expected_aggregate = canonical_aggregate_path(scan_name, job_set_id)
+    expected_generated_artifacts = [
         'condor_{}.sh'.format(expected_task_label),
         'condor_{}.sub'.format(expected_task_label),
     ]
     if provenance['execution_directory'] != expected_directory:
         raise RuntimeError('Condor provenance execution directory is inconsistent')
-    if provenance['expected_outputs'] != expected_outputs:
-        raise RuntimeError('Condor provenance expected outputs are inconsistent')
+    if provenance['expected_members'] != expected_members:
+        raise RuntimeError('Condor provenance expected members are inconsistent')
+    expected_attempts_directory = os.path.join(expected_directory, 'attempts')
+    expected_scheduler_directory = os.path.join(expected_directory, 'scheduler')
+    if provenance['attempts_directory'] != expected_attempts_directory:
+        raise RuntimeError('Condor attempts directory is inconsistent')
+    if provenance['scheduler_directory'] != expected_scheduler_directory:
+        raise RuntimeError('Condor scheduler directory is inconsistent')
     if provenance['aggregate_output'] != expected_aggregate:
         raise RuntimeError('Condor provenance aggregate output is inconsistent')
-    if provenance['submission_artifacts'] != expected_artifacts:
-        raise RuntimeError('Condor provenance submission artifacts are inconsistent')
+    if provenance['final_provenance'] != final_provenance_path(expected_aggregate):
+        raise RuntimeError('Condor final provenance path is inconsistent')
+    if provenance['generated_submission_artifacts'] != expected_generated_artifacts:
+        raise RuntimeError('Generated Condor artifacts are inconsistent')
+    initial_directory = os.path.join(
+        expected_scheduler_directory,
+        'attempt_0001',
+    )
+    if provenance['initial_scheduler_artifacts'] != [
+        os.path.join(initial_directory, expected_generated_artifacts[0]),
+        os.path.join(initial_directory, expected_generated_artifacts[1]),
+    ]:
+        raise RuntimeError('Initial Condor scheduler artifacts are inconsistent')
     return provenance
 
 
 def _write_condor_provenance(provenance):
     directory = provenance['execution_directory']
     path = os.path.join(directory, 'execution_provenance.json')
-    temporary_path = path + '.tmp'
-    if os.path.exists(path) or os.path.exists(temporary_path):
-        raise RuntimeError('Condor provenance path already exists: {}'.format(path))
-    with open(temporary_path, 'x') as stream:
-        json.dump(provenance, stream, indent=2, sort_keys=True)
-        stream.write('\n')
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary_path, path)
-    return path
+    return write_json_exclusive(path, provenance)
 
 
-def _load_condor_provenance(scan_name):
-    path = os.path.join(
-        'condor{}'.format(scan_name),
+def _load_condor_provenance(scan_name, job_set_id=None):
+    prefix = 'condor{}.job_'.format(scan_name)
+    if job_set_id is not None:
+        paths = [
+            os.path.join(
+                '{}{}'.format(prefix, job_set_id),
+                'execution_provenance.json',
+            )
+        ]
+    else:
+        paths = sorted(
+            os.path.join(entry, 'execution_provenance.json')
+            for entry in os.listdir('.')
+            if entry.startswith(prefix) and os.path.isdir(entry)
+        )
+    paths = [path for path in paths if os.path.isfile(path)]
+    if not paths:
+        raise RuntimeError(
+            'Missing identity-scoped Condor execution provenance for {}. '
+            'Refusing partial or legacy glob-only retrieval.'.format(scan_name)
+        )
+    if len(paths) != 1:
+        raise RuntimeError(
+            'Multiple Condor job identities exist for {}; supply an explicit '
+            'job_set_id'.format(scan_name)
+        )
+    provenance = read_json(paths[0])
+    provenance = _validate_condor_provenance(provenance, scan_name)
+    if job_set_id is not None and provenance['job_set_id'] != job_set_id:
+        raise RuntimeError('Condor provenance does not match the requested job_set_id')
+    return provenance
+
+
+def _workspace_guard_lines(recorded_workspace_identity):
+    workspace_path = shlex.quote(recorded_workspace_identity['requested_path'])
+    resolved_path = shlex.quote(recorded_workspace_identity['resolved_path'])
+    expected_size = str(recorded_workspace_identity['size_bytes'])
+    expected_sha256 = shlex.quote(recorded_workspace_identity['sha256'])
+    return [
+        '# EFTFit content-bound workspace precondition\n',
+        'unset PERL5LIB\n',
+        'eftfit_workspace={}\n'.format(workspace_path),
+        'eftfit_expected_resolved={}\n'.format(resolved_path),
+        'eftfit_expected_size={}\n'.format(expected_size),
+        'eftfit_expected_sha256={}\n'.format(expected_sha256),
+        'eftfit_actual_resolved=\n',
+        'eftfit_actual_size=\n',
+        'eftfit_actual_sha256=\n',
+        'if [ -f "$eftfit_workspace" ]; then\n',
+        '  eftfit_actual_resolved=$(readlink -f -- "$eftfit_workspace")\n',
+        '  eftfit_actual_size=$(wc -c < "$eftfit_workspace")\n',
+        '  eftfit_actual_sha256=$(sha256sum -- "$eftfit_workspace" | awk \'{print $1}\')\n',
+        'fi\n',
+        'if [ "$eftfit_actual_resolved" = "$eftfit_expected_resolved" ] && '
+        '[ "$eftfit_actual_size" = "$eftfit_expected_size" ] && '
+        '[ "$eftfit_actual_sha256" = "$eftfit_expected_sha256" ]; then\n',
+    ]
+
+
+def _install_workspace_guard(shell_path, recorded_workspace_identity):
+    with open(shell_path, encoding='utf-8') as stream:
+        lines = stream.readlines()
+    command_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if not line.lstrip().startswith('#')
+            and (
+                line.lstrip().startswith('combine ')
+                or line.lstrip().startswith('combineTool.py ')
+                or ' combine ' in line
+                or ' combineTool.py ' in line
+            )
+        ),
+        None,
+    )
+    if command_index is None:
+        raise RuntimeError('Generated Condor worker has no fit command to guard')
+    guarded_lines = lines[:command_index] + _workspace_guard_lines(
+        recorded_workspace_identity
+    )
+    guarded_lines.extend(lines[command_index:])
+    guarded_lines.extend([
+        'else\n',
+        '  printf "%s\\n" "Workspace content identity mismatch; refusing fit command" >&2\n',
+        '  false\n',
+        'fi\n',
+    ])
+    with open(shell_path, 'w', encoding='utf-8') as stream:
+        stream.writelines(guarded_lines)
+
+
+def _rewrite_submit_file(submit_path, executable_path, logical_member_indices=None):
+    with open(submit_path, encoding='utf-8') as stream:
+        lines = stream.readlines()
+    executable_seen = False
+    arguments_seen = False
+    queue_seen = False
+    rewritten = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('requestMemory') or stripped.startswith('+JobFlavour'):
+            continue
+        if stripped.startswith('executable') and '=' in stripped:
+            rewritten.append('executable = {}\n'.format(os.path.abspath(executable_path)))
+            executable_seen = True
+            continue
+        if logical_member_indices is not None and stripped.startswith('arguments'):
+            rewritten.append('arguments = $(logical_member)\n')
+            arguments_seen = True
+            continue
+        if stripped.startswith('queue'):
+            if logical_member_indices is None:
+                rewritten.extend([
+                    'requestMemory=10000\n',
+                    '+JobFlavour = "workday"\n',
+                    line,
+                ])
+            else:
+                rewritten.append('requestMemory=10000\n')
+                rewritten.append('+JobFlavour = "workday"\n')
+                rewritten.append('queue logical_member from (\n')
+                rewritten.extend('{}\n'.format(index) for index in logical_member_indices)
+                rewritten.append(')\n')
+            queue_seen = True
+            continue
+        rewritten.append(line)
+    if not executable_seen or not queue_seen:
+        raise RuntimeError('Generated Condor submit file has an unexpected structure')
+    if logical_member_indices is not None and not arguments_seen:
+        raise RuntimeError('Generated Condor submit file has no arguments mapping')
+    with open(submit_path, 'w', encoding='utf-8') as stream:
+        stream.writelines(rewritten)
+
+
+def _attempt_record_paths(provenance):
+    directory = provenance['attempts_directory']
+    if not os.path.isdir(directory):
+        return []
+    return sorted(
+        os.path.join(directory, entry)
+        for entry in os.listdir(directory)
+        if re.fullmatch(r'attempt_[0-9]{4}\.json', entry)
+    )
+
+
+def _next_attempt_number(provenance):
+    observed_numbers = [
+        int(os.path.basename(path)[8:12])
+        for path in _attempt_record_paths(provenance)
+    ]
+    scheduler_directory = provenance['scheduler_directory']
+    if os.path.isdir(scheduler_directory):
+        observed_numbers.extend(
+            int(entry[8:12])
+            for entry in os.listdir(scheduler_directory)
+            if re.fullmatch(r'attempt_[0-9]{4}', entry)
+        )
+    return max(observed_numbers or [0]) + 1
+
+
+def _write_attempt_record(
+    provenance,
+    reason,
+    selected_members,
+    scheduler_artifacts,
+    attempt_number=None,
+):
+    if attempt_number is None:
+        attempt_number = _next_attempt_number(provenance)
+    attempt_id = 'attempt_{:04d}'.format(attempt_number)
+    path = os.path.join(provenance['attempts_directory'], attempt_id + '.json')
+    provenance_path = os.path.join(
+        provenance['execution_directory'],
         'execution_provenance.json',
     )
-    if not os.path.isfile(path):
-        raise RuntimeError(
-            'Missing Condor execution provenance for {}. Refusing partial or '
-            'legacy glob-only retrieval.'.format(scan_name)
+    record = {
+        'schema': 1,
+        'attempt_id': attempt_id,
+        'job_set_id': provenance['job_set_id'],
+        'reason': reason,
+        'member_set': selected_members,
+        'created_from': {
+            'path': os.path.realpath(provenance_path),
+            'sha256': sha256_file(provenance_path),
+        },
+        'scheduler_artifacts': scheduler_artifacts,
+    }
+    write_json_exclusive(path, record)
+    return record
+
+
+def _validate_attempt_record(provenance, path, expected_source_sha256):
+    record = read_json(path)
+    expected_attempt_id = os.path.basename(path)[:-5]
+    required_keys = {
+        'schema',
+        'attempt_id',
+        'job_set_id',
+        'reason',
+        'member_set',
+        'created_from',
+        'scheduler_artifacts',
+    }
+    if not isinstance(record, dict) or set(record) != required_keys:
+        raise RuntimeError('Attempt record has an unexpected schema')
+    if record['schema'] != 1 or record['attempt_id'] != expected_attempt_id:
+        raise RuntimeError('Attempt record identity is inconsistent')
+    if record['job_set_id'] != provenance['job_set_id']:
+        raise RuntimeError('Attempt record has a different job_set_id')
+    if not isinstance(record['reason'], str) or not record['reason']:
+        raise RuntimeError('Attempt record reason is invalid')
+    if not isinstance(record['member_set'], list) or not record['member_set']:
+        raise RuntimeError('Attempt record member_set is invalid')
+    serialized_members = [canonical_json_bytes(member) for member in record['member_set']]
+    if len(serialized_members) != len(set(serialized_members)):
+        raise RuntimeError('Attempt record repeats a logical member')
+    expected_members = {
+        canonical_json_bytes(member) for member in provenance['expected_members']
+    }
+    if not set(serialized_members).issubset(expected_members):
+        raise RuntimeError('Attempt record contains an unknown logical member')
+    provenance_path = os.path.join(
+        provenance['execution_directory'],
+        'execution_provenance.json',
+    )
+    if record['created_from'] != {
+        'path': os.path.realpath(provenance_path),
+        'sha256': expected_source_sha256,
+    }:
+        raise RuntimeError('Attempt record does not bind immutable job provenance')
+    if (
+        not isinstance(record['scheduler_artifacts'], list)
+        or len(record['scheduler_artifacts']) != 2
+        or not all(os.path.isfile(path) for path in record['scheduler_artifacts'])
+    ):
+        raise RuntimeError('Attempt scheduler artifacts are missing or invalid')
+    return record
+
+
+def _attempt_history_references(provenance):
+    references = []
+    provenance_path = os.path.join(
+        provenance['execution_directory'],
+        'execution_provenance.json',
+    )
+    expected_source_sha256 = sha256_file(provenance_path)
+    for path in _attempt_record_paths(provenance):
+        record = _validate_attempt_record(
+            provenance,
+            path,
+            expected_source_sha256,
         )
-    with open(path, encoding='utf-8') as stream:
-        provenance = json.load(stream)
-    return _validate_condor_provenance(provenance, scan_name)
+        references.append({
+            'attempt_id': record.get('attempt_id'),
+            'path': os.path.realpath(path),
+            'sha256': sha256_file(path),
+        })
+    return references
+
+
+def _inspect_condor_members(provenance):
+    execution_directory = provenance['execution_directory']
+    expected_by_path = {
+        os.path.join(execution_directory, member['file_name']): member
+        for member in provenance['expected_members']
+    }
+    candidates = sorted(
+        glob.glob(
+            os.path.join(
+                execution_directory,
+                'higgsCombine{}.POINTS*.root'.format(provenance['output_label']),
+            )
+        )
+    )
+    unexpected = sorted(set(candidates) - set(expected_by_path))
+    if unexpected:
+        raise RuntimeError(
+            'Condor result membership is ambiguous; unexpected=[{}]'.format(
+                ','.join(unexpected)
+            )
+        )
+    valid_members = []
+    unresolved_members = []
+    valid_file_identities = []
+    for path, member in expected_by_path.items():
+        if os.path.isfile(path) and os.stat(path).st_size > 0:
+            valid_members.append(member)
+            path_stat = os.stat(path)
+            valid_file_identities.append((path_stat.st_dev, path_stat.st_ino))
+        else:
+            unresolved_members.append(member)
+    if len(valid_file_identities) != len(set(valid_file_identities)):
+        raise RuntimeError('Condor result membership contains duplicate files')
+    return valid_members, unresolved_members
 
 class EFTFit(object):
     def __init__(self):
@@ -504,21 +850,82 @@ class EFTFit(object):
             
             
 
-    def makeWorkspaceEFT(self, datacard='EFT_MultiDim_Datacard.txt'):
+    def makeWorkspaceEFT(
+        self,
+        datacard='EFT_MultiDim_Datacard.txt',
+        output='EFTWorkspace.root',
+        overwrite=False,
+        text2workspace_executable='text2workspace.py',
+    ):
         ### Generates a workspace from a datacard and fit parameterization file ###
         logging.info("Creating workspace")
         if not os.path.isfile(datacard):
-            logging.error("Datacard does not exist!")
-            sys.exit()
+            raise RuntimeError("Datacard does not exist: {}".format(datacard))
         CMSSW_BASE = os.getenv('CMSSW_BASE')
-        args = ['text2workspace.py',datacard,'-P','EFTFit.Fitter.EFTModel:eftmodel','--PO','fits='+CMSSW_BASE+'/src/EFTFit/Fitter/hist_files/EFT_Parameterization.npy','-o','EFTWorkspace.root','--channel-masks']
+        if CMSSW_BASE is None:
+            raise RuntimeError('CMSSW_BASE is required to resolve EFT parameterization')
+        target = os.path.abspath(output)
+        if os.path.lexists(target):
+            if not os.path.isfile(target):
+                raise RuntimeError('Workspace target is not a regular file: {}'.format(target))
+            if not overwrite:
+                raise RuntimeError(
+                    'Workspace target already exists; pass overwrite=True to replace it: '
+                    '{}'.format(target)
+                )
+            old_identity = workspace_identity(output)
+            logging.info('Replacing workspace identity %s', old_identity)
+        target_directory = os.path.dirname(target)
+        if not os.path.isdir(target_directory):
+            raise RuntimeError(
+                'Workspace target directory does not exist: {}'.format(target_directory)
+            )
+        descriptor, temporary_output = tempfile.mkstemp(
+            prefix='.{}.'.format(os.path.basename(target)),
+            suffix='.tmp',
+            dir=target_directory,
+        )
+        os.close(descriptor)
+        os.unlink(temporary_output)
+        args = [
+            text2workspace_executable,
+            datacard,
+            '-P',
+            'EFTFit.Fitter.EFTModel:eftmodel',
+            '--PO',
+            'fits='+CMSSW_BASE+'/src/EFTFit/Fitter/hist_files/EFT_Parameterization.npy',
+            '-o',
+            temporary_output,
+            '--channel-masks',
+        ]
 
-        logging.info(' '.join(args))
-        process = sp.Popen(args, stdout=sp.PIPE, stderr=sp.PIPE)
-        with process.stdout,process.stderr:
-            self.log_subprocess_output(process.stdout,'info')
-            self.log_subprocess_output(process.stderr,'err')
-        process.wait()
+        try:
+            logging.info(' '.join(args))
+            process = sp.Popen(args, stdout=sp.PIPE, stderr=sp.PIPE)
+            with process.stdout,process.stderr:
+                self.log_subprocess_output(process.stdout,'info')
+                self.log_subprocess_output(process.stderr,'err')
+            return_code = process.wait()
+            if return_code != 0:
+                raise RuntimeError(
+                    'text2workspace command failed with code {}'.format(return_code)
+                )
+            if not os.path.isfile(temporary_output) or os.stat(temporary_output).st_size == 0:
+                raise RuntimeError(
+                    'text2workspace did not produce a nonempty workspace replacement'
+                )
+            replacement_identity = file_identity(temporary_output)
+            os.replace(temporary_output, target)
+            published_identity = file_identity(target)
+            if (
+                published_identity['size_bytes'] != replacement_identity['size_bytes']
+                or published_identity['sha256'] != replacement_identity['sha256']
+            ):
+                raise RuntimeError('Published workspace failed byte-identity readback')
+            return workspace_identity(output)
+        finally:
+            if os.path.exists(temporary_output):
+                os.unlink(temporary_output)
         
     def bestFit(self, name='.test', params_POI=[], startValuesString='', freeze=False, autoBounds=True, other=[]):
         ### Multidimensional fit ###
@@ -749,13 +1156,14 @@ class EFTFit(object):
             _validate_condor_provenance(condor_provenance, name)
             if os.path.exists(condor_provenance['execution_directory']):
                 raise RuntimeError(
-                    'Execution directory {} already exists'.format(
+                    'Execution directory {} already exists; use recoverGridScan '
+                    'for an intentional same-identity recovery'.format(
                         condor_provenance['execution_directory']
                     )
                 )
             colliding_artifacts = [
                 path
-                for path in condor_provenance['submission_artifacts']
+                for path in condor_provenance['generated_submission_artifacts']
                 if os.path.exists(path)
             ]
             if colliding_artifacts:
@@ -802,40 +1210,54 @@ class EFTFit(object):
             return
 
         if batch == 'condor':
-            os.mkdir(condor_provenance['execution_directory'])
-            shell_path, submit_path = condor_provenance['submission_artifacts']
-            setup_commands = [
-                ['chmod', 'a+x', shell_path],
-                ['sed', '-i', 's/ulimit.*/&\\nunset PERL5LIB/', shell_path],
-                ['sed', '-i', 's/queue/\\n\\nrequestMemory=10000\\n+JobFlavour = "workday"\\n\\nqueue/', submit_path],
+            generated_shell, generated_submit = condor_provenance[
+                'generated_submission_artifacts'
             ]
-            for command in setup_commands:
-                return_code = sp.call(command)
-                if return_code != 0:
-                    raise RuntimeError(
-                        'Condor setup command failed with code {}: {}'.format(
-                            return_code,
-                            ' '.join(command),
-                        )
-                    )
-
-            # Replace hardcoded paths with $CMSSW_BASE and dynamic paths
-            cmssw_base = os.getenv('CMSSW_BASE')
-            test_dir = os.path.join(cmssw_base, 'src', 'EFTFit', 'Fitter', 'test')
-
-            return_code = sp.call(['sed', '-i',
-                                   's|executable = \\(.*\\)|executable = /users/ywan2/EFTFit_env14_2024/CMSSW_14_1_0_pre4/src/EFTFit/Fitter/test/{}\\narguments = $(ProcId)|'.format(shell_path),
-                                   submit_path
-            ])
-            if return_code != 0:
-                raise RuntimeError('Failed to update the Condor executable path')
-
+            if not os.path.isfile(generated_shell) or not os.path.isfile(generated_submit):
+                raise RuntimeError('CombineTool did not produce the recorded Condor artifacts')
+            validate_workspace_identity(condor_provenance['workspace_identity'])
+            os.makedirs(condor_provenance['attempts_directory'])
+            initial_scheduler_directory = os.path.join(
+                condor_provenance['scheduler_directory'],
+                'attempt_0001',
+            )
+            os.makedirs(initial_scheduler_directory)
             _write_condor_provenance(condor_provenance)
-            
+
+            _install_workspace_guard(
+                generated_shell,
+                condor_provenance['workspace_identity'],
+            )
+            shell_path, submit_path = condor_provenance['initial_scheduler_artifacts']
+            _rewrite_submit_file(generated_submit, shell_path)
+            os.chmod(
+                generated_shell,
+                os.stat(generated_shell).st_mode
+                | stat.S_IXUSR
+                | stat.S_IXGRP
+                | stat.S_IXOTH,
+            )
+            os.replace(generated_shell, shell_path)
+            os.replace(generated_submit, submit_path)
+            _write_attempt_record(
+                condor_provenance,
+                'initial_submission',
+                condor_provenance['expected_members'],
+                [os.path.realpath(shell_path), os.path.realpath(submit_path)],
+                attempt_number=1,
+            )
+
             logging.info('Now submitting condor jobs.')
-            condorsub = sp.Popen(['condor_submit', '-append', 'initialdir={}'.format(condor_provenance['execution_directory']), submit_path],
-                                 stdout=sp.PIPE, stderr=sp.PIPE)
-            #Maybe can be commented out
+            condorsub = sp.Popen(
+                [
+                    'condor_submit',
+                    '-append',
+                    'initialdir={}'.format(condor_provenance['execution_directory']),
+                    submit_path,
+                ],
+                stdout=sp.PIPE,
+                stderr=sp.PIPE,
+            )
             with condorsub.stdout, condorsub.stderr:
                 self.log_subprocess_output(condorsub.stdout, 'info')
                 self.log_subprocess_output(condorsub.stderr, 'err')
@@ -920,7 +1342,78 @@ class EFTFit(object):
         return ','.join(startValues)
 
 
-    def retrieveGridScan(self, name='.test', batch='crab', user='apiccine', require_condor_provenance=False):#getpass.getuser()):
+    def recoverGridScan(self, name, job_set_id=None):
+        """Intentionally resubmit only unresolved members of one Condor job set."""
+        provenance = _load_condor_provenance(name, job_set_id)
+        validate_workspace_identity(provenance['workspace_identity'])
+        _, unresolved_members = _inspect_condor_members(provenance)
+        if not unresolved_members:
+            logging.info('No unresolved members for %s; recovery is a no-op.', name)
+            return None
+
+        attempt_number = _next_attempt_number(provenance)
+        attempt_id = 'attempt_{:04d}'.format(attempt_number)
+        scheduler_directory = os.path.join(
+            provenance['scheduler_directory'],
+            attempt_id,
+        )
+        if os.path.exists(scheduler_directory):
+            raise RuntimeError(
+                'Recovery scheduler directory already exists: {}'.format(
+                    scheduler_directory
+                )
+            )
+        os.makedirs(scheduler_directory)
+        initial_shell, initial_submit = provenance['initial_scheduler_artifacts']
+        if not os.path.isfile(initial_shell) or not os.path.isfile(initial_submit):
+            raise RuntimeError('Initial scheduler templates are missing')
+        shell_path = os.path.join(scheduler_directory, os.path.basename(initial_shell))
+        submit_path = os.path.join(scheduler_directory, os.path.basename(initial_submit))
+        shutil.copy2(initial_shell, shell_path)
+        shutil.copy2(initial_submit, submit_path)
+        _rewrite_submit_file(
+            submit_path,
+            shell_path,
+            [member['member_index'] for member in unresolved_members],
+        )
+        attempt = _write_attempt_record(
+            provenance,
+            'recovery_missing_members',
+            unresolved_members,
+            [os.path.realpath(shell_path), os.path.realpath(submit_path)],
+            attempt_number=attempt_number,
+        )
+        logging.info(
+            'Recovery is operator-requested and does not infer live scheduler state.'
+        )
+        condorsub = sp.Popen(
+            [
+                'condor_submit',
+                '-append',
+                'initialdir={}'.format(provenance['execution_directory']),
+                submit_path,
+            ],
+            stdout=sp.PIPE,
+            stderr=sp.PIPE,
+        )
+        with condorsub.stdout, condorsub.stderr:
+            self.log_subprocess_output(condorsub.stdout, 'info')
+            self.log_subprocess_output(condorsub.stderr, 'err')
+        return_code = condorsub.wait()
+        if return_code != 0:
+            raise RuntimeError(
+                'Condor recovery submission failed with code {}'.format(return_code)
+            )
+        return attempt
+
+    def retrieveGridScan(
+        self,
+        name='.test',
+        batch='crab',
+        user='apiccine',
+        require_condor_provenance=False,
+        job_set_id=None,
+    ):#getpass.getuser()):
         ### Retrieves finished grid jobs, extracts, and hadd's into a single file ###
         taskname = _scheduler_task_label(name)
         logging.info("Retrieving gridScan files. Task name: "+taskname)
@@ -967,11 +1460,7 @@ class EFTFit(object):
             sp.call(['rm','-r',taskname+'tmp'])
             
         elif batch=='condor':
-            provenance_path = os.path.join(
-                'condor{}'.format(name),
-                'execution_provenance.json',
-            )
-            if not require_condor_provenance and not os.path.isfile(provenance_path):
+            if not require_condor_provenance:
                 legacy_outputs = sorted(
                     glob.glob('higgsCombine{}.POINTS*.root'.format(name))
                 )
@@ -1002,45 +1491,35 @@ class EFTFit(object):
                     os.rename('condor_{}.sub'.format(name.replace('.','')),'condor{0}/condor_{0}.sub'.format(name))
                 return
 
-            provenance = _load_condor_provenance(name)
+            provenance = _load_condor_provenance(name, job_set_id)
             execution_directory = provenance['execution_directory']
-            expected_paths = [
-                os.path.join(execution_directory, output)
-                for output in provenance['expected_outputs']
-            ]
-            candidate_paths = sorted(
-                glob.glob(
-                    os.path.join(
-                        execution_directory,
-                        'higgsCombine{}.POINTS*.root'.format(
-                            provenance['output_label']
-                        ),
-                    )
-                )
-            )
-            missing_paths = sorted(set(expected_paths) - set(candidate_paths))
-            unexpected_paths = sorted(set(candidate_paths) - set(expected_paths))
-            if missing_paths or unexpected_paths:
+            _, unresolved_members = _inspect_condor_members(provenance)
+            if unresolved_members:
                 raise RuntimeError(
-                    'Condor result membership is incomplete or ambiguous; '
-                    'missing=[{}], unexpected=[{}]'.format(
-                        ','.join(missing_paths),
-                        ','.join(unexpected_paths),
+                    'Condor result membership is incomplete; unresolved=[{}]'.format(
+                        ','.join(
+                            member['file_name'] for member in unresolved_members
+                        )
                     )
                 )
-            file_identities = [
-                (os.stat(path).st_dev, os.stat(path).st_ino)
-                for path in expected_paths
+            expected_paths = [
+                os.path.join(execution_directory, member['file_name'])
+                for member in provenance['expected_members']
             ]
-            if len(file_identities) != len(set(file_identities)):
-                raise RuntimeError('Condor result membership contains duplicate files')
 
             aggregate_output = provenance['aggregate_output']
-            temporary_output = '{}.{}.tmp'.format(
+            aggregate_directory = os.path.dirname(os.path.abspath(aggregate_output))
+            if not os.path.isdir(aggregate_directory):
+                raise RuntimeError(
+                    'Canonical aggregate directory does not exist: {}'.format(
+                        aggregate_directory
+                    )
+                )
+            temporary_output = '{}.{}.candidate'.format(
                 aggregate_output,
-                provenance['job_set_id'][:12],
+                provenance['job_set_id'],
             )
-            if os.path.exists(temporary_output):
+            if os.path.lexists(temporary_output):
                 raise RuntimeError(
                     'Temporary aggregate output already exists: {}'.format(
                         temporary_output
@@ -1054,30 +1533,79 @@ class EFTFit(object):
                 self.log_subprocess_output(process.stderr,'err')
             return_code = process.wait()
             if return_code != 0:
+                if os.path.exists(temporary_output):
+                    os.unlink(temporary_output)
                 raise RuntimeError(
                     'Condor aggregation failed with code {}; preserving all '
                     'source outputs'.format(return_code)
                 )
-            if not os.path.isfile(temporary_output):
+            if (
+                not os.path.isfile(temporary_output)
+                or os.stat(temporary_output).st_size == 0
+            ):
+                if os.path.exists(temporary_output):
+                    os.unlink(temporary_output)
                 raise RuntimeError(
-                    'Condor aggregation returned success without producing {}'.format(
+                    'Condor aggregation returned success without producing a '
+                    'nonempty {}'.format(
                         temporary_output
                     )
                 )
-            os.replace(temporary_output, aggregate_output)
-
-            for artifact in provenance['submission_artifacts']:
-                if os.path.isfile(artifact):
-                    destination = os.path.join(execution_directory, artifact)
-                    if os.path.exists(destination):
+            candidate_identity = file_identity(temporary_output)
+            if os.path.exists(aggregate_output):
+                existing_identity = file_identity(aggregate_output)
+                if (
+                    existing_identity['size_bytes'] != candidate_identity['size_bytes']
+                    or existing_identity['sha256'] != candidate_identity['sha256']
+                ):
+                    os.unlink(temporary_output)
+                    raise RuntimeError(
+                        'Canonical aggregate already exists with different bytes; '
+                        'refusing to choose a winner'
+                    )
+                os.unlink(temporary_output)
+                publication_state = 'verified_existing_identical'
+            else:
+                try:
+                    os.link(temporary_output, aggregate_output)
+                    publication_state = 'published_new_canonical'
+                except FileExistsError:
+                    existing_identity = file_identity(aggregate_output)
+                    if (
+                        existing_identity['size_bytes'] != candidate_identity['size_bytes']
+                        or existing_identity['sha256'] != candidate_identity['sha256']
+                    ):
+                        os.unlink(temporary_output)
                         raise RuntimeError(
-                            'Condor artifact destination already exists: {}'.format(
-                                destination
-                            )
+                            'Canonical aggregate appeared with different bytes '
+                            'during publication'
                         )
-                    os.rename(artifact, destination)
-            for rootfile in expected_paths:
-                os.remove(rootfile)
+                    publication_state = 'verified_concurrent_identical'
+                os.unlink(temporary_output)
+
+            attempt_references = _attempt_history_references(provenance)
+            final_provenance = build_final_provenance(
+                provenance,
+                aggregate_output,
+                attempt_references,
+                publication_state,
+            )
+            sidecar = provenance['final_provenance']
+            if os.path.exists(sidecar):
+                validate_final_provenance(
+                    sidecar,
+                    provenance['scan_name'],
+                    provenance['job_set_id'],
+                )
+            else:
+                write_json_exclusive(sidecar, final_provenance)
+            canonical = validate_final_provenance(
+                sidecar,
+                provenance['scan_name'],
+                provenance['job_set_id'],
+            )
+            logging.info('Validated canonical aggregate %s', canonical)
+            return canonical
 
     def submitEFTWilks(self, name='.test', limits='/users/b/byates2/Public/wc_top22006_a24_prof_2sigma.json', workspace='ptz-lj0pt_fullR2_anatest24v01_withAutostats_withSys.root', doBest=False, asimov=False, fixed=False, wc=None, sig=0, batch='condor'):
         '''
@@ -1438,6 +1966,22 @@ class EFTFit(object):
                 self.log_subprocess_output(process.stderr,'err')
             process.wait()
 
+    def batchRecover1DScansEFT(
+        self,
+        basename='.EFT.gridScan',
+        scan_wcs=[],
+        job_set_ids=None,
+    ):
+        """Intentionally retry unresolved members of maintained 1D Condor scans."""
+        if not scan_wcs:
+            scan_wcs = self.wcs
+        job_set_ids = job_set_ids or {}
+        for wc in scan_wcs:
+            self.recoverGridScan(
+                _one_dimensional_scan_name(basename, wc),
+                job_set_ids.get(wc),
+            )
+
     def batchResubmit2DScansEFT(self, basename='.EFT.gridScan', allPairs=False):
         ### For pairs of wcs, attempt to resubmit failed CRAB jobs ###
 
@@ -1463,16 +2007,24 @@ class EFTFit(object):
                     self.log_subprocess_output(process.stderr,'err')
                 process.wait()
 
-    def batchRetrieve1DScansEFT(self, basename='.test', batch='crab', scan_wcs=[]):
+    def batchRetrieve1DScansEFT(
+        self,
+        basename='.test',
+        batch='crab',
+        scan_wcs=[],
+        job_set_ids=None,
+    ):
         ### For each wc, retrieves finished 1D deltaNLL grid jobs, extracts, and hadd's into a single file ###
         if not scan_wcs:
             scan_wcs = self.wcs
+        job_set_ids = job_set_ids or {}
 
         for wc in scan_wcs:
             self.retrieveGridScan(
                 _one_dimensional_scan_name(basename,wc),
                 batch,
                 require_condor_provenance=(batch == 'condor'),
+                job_set_id=job_set_ids.get(wc),
             )
 
     def batchRetrieve2DScansEFT(self, basename='.EFT.gridScan', batch='crab', allPairs=False, wcs=[]):

@@ -73,6 +73,10 @@ Now we can actually run combine to perform the fits.
     ```
     time source ../scripts/text2workspace.sh
     ```
+    The wrapper refuses to replace an existing `workspace.root`. Pass
+    `--overwrite` explicitly when replacement is intended; the replacement is
+    generated and validated at a temporary sibling path before it is atomically
+    published. A failed or empty generation preserves the existing workspace.
     You can open `text2workspace.sh` to change physics model to AAC.
 
 - Run combine with our EFTFit tools
@@ -127,24 +131,46 @@ evidence-backed intentional retirement.
 
 #### Condor 1D scan execution provenance
 
-`batch1DScanEFT` Condor submissions derive a job-set identity from the complete command
-after excluding only the Combine output label (`-n`) and scheduler task label
-(`--task-name`). The identity is embedded in both labels, so result filenames
-cannot be mistaken for outputs from another invocation with the same
-user-facing basename. The submission writes the machine-derived contract to
-`condor<scan_name>/execution_provenance.json`; this file is execution
-provenance, not a fit-configuration or physics authority.
+`batch1DScanEFT` Condor submissions derive a job-set identity from the complete
+semantic command and the exact workspace bytes. Workspace identity records the
+requested and resolved paths, byte size, and SHA-256. Only the Combine output
+label (`-n`) and scheduler task label (`--task-name`) are excluded from semantic
+command identity. Every generated worker verifies the recorded workspace
+identity before its fit command; a missing or changed workspace stops the
+worker before Combine.
 
-`batchRetrieve1DScansEFT` Condor retrieval requires that contract and the exact recorded `POINTS`
-members. Missing, unexpected, duplicate, stale, or inconsistent members stop
-retrieval before aggregation. Aggregation does not use `hadd -k`, publishes the
-combined file only after `hadd` succeeds, and removes only the recorded split
-outputs after success. Pre-provenance Condor job directories cannot establish
-complete membership and are intentionally refused by the 1D retrieval entry
-point rather than collected from a broad glob. Historical 2D/3D collection is
-unchanged and does not inherit this guarantee.
+The full identity is embedded in output labels and stored under
+`condor<scan_name>.job_<job_set_id>/`. That directory contains immutable
+`execution_provenance.json`, scheduler material, and monotonic records under
+`attempts/`. An operator may call `batchRecover1DScansEFT` to intentionally
+retry only members still unresolved against the recorded expected member set.
+This does not inspect or infer live scheduler state. Recovery retains the same
+job-set identity and records a new attempt; a changed workspace or command is a
+different job set.
 
-CRAB keeps its historical submission, retrieval, and resubmission interfaces.
+`batchRetrieve1DScansEFT` requires the exact recorded `POINTS` members.
+Missing, unexpected, duplicate, stale, or inconsistent members stop retrieval
+before aggregation. Successful aggregation preserves split-member evidence and
+publishes an identity-bearing canonical file named
+`higgsCombine<scan_name>.job_<job_set_id>.MultiDimFit.root`, with an adjacent
+byte-bound provenance sidecar. Different identities coexist. Republishing the
+same identity is a verified no-op only when bytes agree; conflicting bytes fail
+closed. Pre-provenance Condor directories cannot establish complete membership
+and are intentionally refused by the maintained 1D entry point. Historical
+2D/3D collection is unchanged and does not inherit this guarantee.
+
+Maintained current 1D plotting paths resolve these canonical files directly.
+With no explicit identity, resolution succeeds only when exactly one validated
+canonical result exists for a scan name; zero results fail as missing and
+multiple results fail as ambiguous. Supply the appropriate scan-name or WC key
+to job-set mapping through the plotting or retrieval `job_set_ids` argument
+when multiple identities coexist. The stable pre-identity filename is not
+persistent authority. A relative stable-name symlink is available only as a locked, context-bounded
+compatibility view for specialist consumers, and is removed when that context
+ends.
+
+CRAB is not part of this maintained identity/recovery contract and keeps its
+historical submission, retrieval, and resubmission interfaces.
 Submission and resubmission now share the same task-label constructor, but the
 historical CRAB archives do not provide a repository-local exact expected-member
 contract. CRAB retrieval therefore does not carry the Condor completeness

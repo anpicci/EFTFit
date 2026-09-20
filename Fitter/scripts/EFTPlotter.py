@@ -8,6 +8,7 @@ import subprocess as sp
 import os
 from operator import itemgetter
 from EFTFit.Fitter.ContourHelper import ContourHelper
+from EFTFit.Fitter.execution_provenance import resolve_canonical_aggregate
 from scipy.signal import argrelextrema
 import numpy as np
 
@@ -217,16 +218,27 @@ class EFTPlot(object):
     # Optionally removes duplicate wc points (choosing min nll)
     def GetWCsNLLFromRoot(self,base_name_lst,wc,unique=False,**kwargs):
         dir_path    = kwargs.pop('dir_path','../fit_files')
+        postfix     = kwargs.pop('postfix','')
+        job_set_ids = kwargs.pop('job_set_ids',{})
 
         graphwcs = []
         graphnlls = []
         for name in base_name_lst:
-            if not os.path.exists('{}/higgsCombine{}.MultiDimFit.root'.format(dir_path,name)):
-                logging.error("File {}/higgsCombine{}.MultiDimFit.root does not exist!".format(dir_path,name))
-                return [graphwcs,graphnlls]
+            if postfix:
+                result_path = '{}/higgsCombine{}.MultiDimFit{}.root'.format(
+                    dir_path,
+                    name,
+                    postfix,
+                )
+            else:
+                result_path = resolve_canonical_aggregate(
+                    name,
+                    job_set_ids.get(name),
+                    dir_path,
+                )
 
             # Get scan tree
-            rootFile = ROOT.TFile.Open('{}/higgsCombine{}.MultiDimFit.root'.format(dir_path,name))
+            rootFile = ROOT.TFile.Open(result_path)
             limitTree = rootFile.Get('limit')
 
             # Get coordinates for TGraph
@@ -382,6 +394,8 @@ class EFTPlot(object):
         d2  = kwargs.pop('dir2','../fit_files')
         pf1 = kwargs.pop('pf1','')
         pf2 = kwargs.pop('pf2','')
+        job_set_ids1 = kwargs.pop('job_set_ids1',{})
+        job_set_ids2 = kwargs.pop('job_set_ids2',{})
         log = kwargs.pop('log',False)
         nll_1sigma = kwargs.pop('nll_1sigma',1)
         nll_2sigma = kwargs.pop('nll_2sigma',4)
@@ -395,11 +409,15 @@ class EFTPlot(object):
             logging.error("No wc specified!")
             return
         for name1 in name1_lst:
-            if not os.path.exists('{}/higgsCombine{}.MultiDimFit{}.root'.format(d1,name1,pf1)):
+            if not pf1:
+                resolve_canonical_aggregate(name1, job_set_ids1.get(name1), d1)
+            elif not os.path.exists('{}/higgsCombine{}.MultiDimFit{}.root'.format(d1,name1,pf1)):
                 logging.error("File higgsCombine{}.MultiDimFit{}.root does not exist!".format(name1,pf1))
                 return
         for name2 in name1_lst:
-            if not os.path.exists('{}/higgsCombine{}.MultiDimFit{}.root'.format(d2,name2,pf2)):
+            if not pf2:
+                resolve_canonical_aggregate(name2, job_set_ids2.get(name2), d2)
+            elif not os.path.exists('{}/higgsCombine{}.MultiDimFit{}.root'.format(d2,name2,pf2)):
                 logging.error("File higgsCombine{}.MultiDimFit{}.root does not exist!".format(name2,pf2))
                 return
 
@@ -411,8 +429,22 @@ class EFTPlot(object):
         p1.cd()
 
         # Get coordinates for TGraphs
-        graph1wcs,graph1nlls = self.GetWCsNLLFromRoot(name1_lst,wc,unique=True,dir_path=d1)
-        graph2wcs,graph2nlls = self.GetWCsNLLFromRoot(name2_lst,wc,unique=True,dir_path=d2)
+        graph1wcs,graph1nlls = self.GetWCsNLLFromRoot(
+            name1_lst,
+            wc,
+            unique=True,
+            dir_path=d1,
+            postfix=pf1,
+            job_set_ids=job_set_ids1,
+        )
+        graph2wcs,graph2nlls = self.GetWCsNLLFromRoot(
+            name2_lst,
+            wc,
+            unique=True,
+            dir_path=d2,
+            postfix=pf2,
+            job_set_ids=job_set_ids2,
+        )
 
         # Rezero the y axis and make the tgraphs
         #zero = graph1nlls.index(0)
@@ -1897,6 +1929,7 @@ class EFTPlot(object):
         siginterval = kwargs.pop('siginterval',2)
         dir_path    = kwargs.pop('dir_path','../fit_files')
         postfix     = kwargs.pop('postfix','')
+        job_set_ids = kwargs.pop('job_set_ids',{})
         nll_max     = kwargs.pop('nll_max',4)
         ### Return a table of parameters, their best fits, and their uncertainties ###
         ### Use 1D scans instead of regular MultiDimFit ###
@@ -1914,7 +1947,20 @@ class EFTPlot(object):
             missing_wc = False
             for basename in basename_lst:
                 logging.debug("Obtaining result of scan: higgsCombine{}.{}.MultiDimFit{}.root".format(basename,param,postfix))
-                fit_file = ROOT.TFile.Open('{}/higgsCombine{}.{}.MultiDimFit{}.root'.format(dir_path,basename,param,postfix))
+                scan_name = '{}.{}'.format(basename, param)
+                if postfix:
+                    result_path = '{}/higgsCombine{}.MultiDimFit{}.root'.format(
+                        dir_path,
+                        scan_name,
+                        postfix,
+                    )
+                else:
+                    result_path = resolve_canonical_aggregate(
+                        scan_name,
+                        job_set_ids.get(scan_name),
+                        dir_path,
+                    )
+                fit_file = ROOT.TFile.Open(result_path)
                 try:
                     _ = fit_file.Get('limit')
                     fit_file.Close()
@@ -1925,7 +1971,14 @@ class EFTPlot(object):
             if missing_wc: continue
 
             basename_lst_with_wcs_appended = self.AppendStrToItemsInLst(basename_lst,"."+param)
-            wc_values, nll_values = self.GetWCsNLLFromRoot(basename_lst_with_wcs_appended,param,unique=True,dir_path=dir_path)
+            wc_values, nll_values = self.GetWCsNLLFromRoot(
+                basename_lst_with_wcs_appended,
+                param,
+                unique=True,
+                dir_path=dir_path,
+                postfix=postfix,
+                job_set_ids=job_set_ids,
+            )
 
             # Rezero deltanll values
             bestNLL = min(nll_values)

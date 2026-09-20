@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import types
 
@@ -26,11 +27,18 @@ class RecordedProcess:
 class RecordingSubprocess:
     PIPE = object()
 
-    def __init__(self, aggregation_return_code=0, create_aggregate=False):
+    def __init__(
+        self,
+        aggregation_return_code=0,
+        aggregate_bytes=b"aggregate",
+        workspace_return_code=0,
+        workspace_bytes=b"workspace replacement",
+    ):
         self.aggregation_return_code = aggregation_return_code
-        self.create_aggregate = create_aggregate
+        self.aggregate_bytes = aggregate_bytes
+        self.workspace_return_code = workspace_return_code
+        self.workspace_bytes = workspace_bytes
         self.popen_calls = []
-        self.call_calls = []
 
     def Popen(self, argv, **kwargs):
         argv = list(argv)
@@ -38,26 +46,31 @@ class RecordingSubprocess:
         if argv[0] == "combineTool.py":
             task_label = argv[argv.index("--task-name") + 1]
             Path("condor_{}.sh".format(task_label)).write_text(
-                "#!/bin/sh\n", encoding="utf-8"
+                "#!/bin/sh\nset -e\ncombine --synthetic-fit \"$@\"\n",
+                encoding="utf-8",
             )
             Path("condor_{}.sub".format(task_label)).write_text(
-                "executable = placeholder\nqueue\n", encoding="utf-8"
+                "executable = placeholder\narguments = $(ProcId)\nqueue 2\n",
+                encoding="utf-8",
             )
             return RecordedProcess()
         if argv[0] == "hadd":
-            if self.create_aggregate:
-                Path(argv[2]).write_bytes(b"aggregate")
+            if self.aggregation_return_code == 0 and self.aggregate_bytes is not None:
+                Path(argv[2]).write_bytes(self.aggregate_bytes)
             return RecordedProcess(self.aggregation_return_code)
+        if argv[0] == "condor_submit":
+            return RecordedProcess()
+        if "-o" in argv:
+            if self.workspace_return_code == 0 and self.workspace_bytes is not None:
+                Path(argv[argv.index("-o") + 1]).write_bytes(self.workspace_bytes)
+            return RecordedProcess(self.workspace_return_code)
         return RecordedProcess()
-
-    def call(self, argv, **kwargs):
-        self.call_calls.append(list(argv))
-        return 0
 
 
 @pytest.fixture
 def eftfitter(monkeypatch):
     sys.path.insert(0, str(FITTER_DIR / "python"))
+    import execution_provenance
     import wc_fit_config
 
     root_module = types.ModuleType("ROOT")
@@ -76,9 +89,10 @@ def eftfitter(monkeypatch):
     monkeypatch.setitem(sys.modules, "EFTFit.Fitter.findMask", find_mask_module)
     monkeypatch.setitem(
         sys.modules,
-        "EFTFit.Fitter.wc_fit_config",
-        wc_fit_config,
+        "EFTFit.Fitter.execution_provenance",
+        execution_provenance,
     )
+    monkeypatch.setitem(sys.modules, "EFTFit.Fitter.wc_fit_config", wc_fit_config)
 
     spec = importlib.util.spec_from_file_location(
         "eftfitter_execution_provenance_under_test",
@@ -95,11 +109,11 @@ def make_fitter(module):
     return fitter
 
 
-def make_condor_provenance(module, scan_name=".provenance.c_one"):
-    argv = [
+def base_condor_argv(workspace, scan_name=".provenance.c_one"):
+    return [
         "combineTool.py",
         "-d",
-        "/synthetic/workspace.root",
+        str(workspace),
         "-M",
         "MultiDimFit",
         "--algo",
@@ -113,56 +127,75 @@ def make_condor_provenance(module, scan_name=".provenance.c_one"):
         "--job-mode",
         "condor",
         "--task-name",
-        module._scheduler_task_label(scan_name),
+        scan_name.replace(".", ""),
         "--split-points",
         "10",
         "--dry-run",
     ]
+
+
+def make_condor_provenance(module, workspace, scan_name=".provenance.c_one"):
+    argv = base_condor_argv(workspace, scan_name)
     provenance = module._build_condor_provenance(scan_name, argv, 20, 10)
     module._replace_option_value(argv, "-n", provenance["output_label"])
     module._replace_option_value(
-        argv,
-        "--task-name",
-        provenance["scheduler_task_label"],
+        argv, "--task-name", provenance["scheduler_task_label"]
     )
     provenance["command_argv"] = argv
     module._validate_condor_provenance(provenance, scan_name)
-    Path(provenance["execution_directory"]).mkdir()
+    Path(provenance["attempts_directory"]).mkdir(parents=True)
+    initial_directory = Path(provenance["scheduler_directory"]) / "attempt_0001"
+    initial_directory.mkdir(parents=True)
     module._write_condor_provenance(provenance)
+    shell_path, submit_path = map(Path, provenance["initial_scheduler_artifacts"])
+    shell_path.write_text("#!/bin/sh\nset -e\ncombine --synthetic-fit\n", encoding="utf-8")
+    shell_path.chmod(0o755)
+    submit_path.write_text(
+        "executable = {}\narguments = $(ProcId)\nrequestMemory=10000\n"
+        "+JobFlavour = \"workday\"\nqueue 2\n".format(shell_path.resolve()),
+        encoding="utf-8",
+    )
+    module._install_workspace_guard(shell_path, provenance["workspace_identity"])
+    module._write_attempt_record(
+        provenance,
+        "initial_submission",
+        provenance["expected_members"],
+        [str(shell_path.resolve()), str(submit_path.resolve())],
+        attempt_number=1,
+    )
     return provenance
 
 
-def prepare_retrieval_directory(tmp_path, monkeypatch):
+def prepare_directory(tmp_path, monkeypatch):
     work_directory = tmp_path / "test"
     fit_directory = tmp_path / "fit_files"
     work_directory.mkdir()
     fit_directory.mkdir()
+    workspace = work_directory / "workspace.root"
+    workspace.write_bytes(b"workspace bytes")
     monkeypatch.chdir(work_directory)
-    return work_directory, fit_directory
+    return workspace, fit_directory
 
 
-def create_expected_outputs(provenance):
+def create_expected_outputs(provenance, content=b"result"):
     paths = [
-        Path(provenance["execution_directory"]) / output
-        for output in provenance["expected_outputs"]
+        Path(provenance["execution_directory"]) / member["file_name"]
+        for member in provenance["expected_members"]
     ]
-    for path in paths:
-        path.write_bytes(b"result")
+    for index, path in enumerate(paths):
+        path.write_bytes(content + str(index).encode("ascii"))
     return paths
 
 
-def test_condor_submission_binds_identity_without_changing_semantic_argv(
+def test_initial_submission_binds_workspace_bytes_and_records_attempt(
     eftfitter, tmp_path, monkeypatch
 ):
-    monkeypatch.chdir(tmp_path)
+    workspace, _ = prepare_directory(tmp_path, monkeypatch)
     monkeypatch.setenv("CMSSW_BASE", str(tmp_path / "cmssw"))
-    workspace = tmp_path / "workspace.root"
-    workspace.write_bytes(b"synthetic")
     recorder = RecordingSubprocess()
     monkeypatch.setattr(eftfitter, "sp", recorder)
 
-    fitter = make_fitter(eftfitter)
-    fitter.gridScan(
+    make_fitter(eftfitter).gridScan(
         name=".provenance.c_one",
         batch="condor",
         freeze=False,
@@ -175,172 +208,324 @@ def test_condor_submission_binds_identity_without_changing_semantic_argv(
     )
 
     command = next(call for call in recorder.popen_calls if call[0] == "combineTool.py")
-    provenance_path = tmp_path / "condor.provenance.c_one" / "execution_provenance.json"
-    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-    assert eftfitter._validate_condor_provenance(
-        provenance, ".provenance.c_one"
-    ) == provenance
-    assert command[command.index("-n") + 1] == provenance["output_label"]
-    assert command[command.index("--task-name") + 1] == provenance[
-        "scheduler_task_label"
-    ]
-    assert eftfitter._semantic_argv(command) == [
-        "combineTool.py",
-        "-d",
-        str(workspace),
-        "-M",
-        "MultiDimFit",
-        "--algo",
-        "grid",
-        "--cminPreScan",
-        "--cminDefaultMinimizerStrategy=0",
-        "--points",
-        "20",
-        "-P",
-        "c_one",
-        "--trackParameters",
-        "c_two",
-        "--floatOtherPOIs",
-        "1",
-        "-t",
-        "-1",
-        "--setParameters",
-        "c_one=0,c_two=0",
-        "--job-mode",
-        "condor",
-        "--split-points",
-        "10",
-        "--dry-run",
-    ]
-
-
-def test_complete_expected_result_set_succeeds(eftfitter, tmp_path, monkeypatch):
-    _, fit_directory = prepare_retrieval_directory(tmp_path, monkeypatch)
-    provenance = make_condor_provenance(eftfitter)
-    expected_paths = create_expected_outputs(provenance)
-    unrelated = Path(provenance["execution_directory"]) / "unrelated.root"
-    unrelated.write_bytes(b"unrelated")
-    for artifact in provenance["submission_artifacts"]:
-        Path(artifact).write_text("submission artifact\n", encoding="utf-8")
-
-    recorder = RecordingSubprocess(create_aggregate=True)
-    monkeypatch.setattr(eftfitter, "sp", recorder)
-    make_fitter(eftfitter).retrieveGridScan(provenance["scan_name"], "condor")
-
-    aggregate = fit_directory / "higgsCombine{}.MultiDimFit.root".format(
-        provenance["scan_name"]
+    directories = list(Path(".").glob("condor.provenance.c_one.job_*"))
+    assert len(directories) == 1
+    provenance = json.loads(
+        (directories[0] / "execution_provenance.json").read_text(encoding="utf-8")
     )
-    assert aggregate.read_bytes() == b"aggregate"
-    assert all(not path.exists() for path in expected_paths)
-    assert unrelated.exists()
-    assert (
-        Path(provenance["execution_directory"]) / "execution_provenance.json"
-    ).is_file()
-    assert all(
-        (Path(provenance["execution_directory"]) / artifact).is_file()
-        for artifact in provenance["submission_artifacts"]
+    assert eftfitter._validate_condor_provenance(provenance, ".provenance.c_one")
+    assert len(provenance["job_set_id"]) == 64
+    assert provenance["workspace_identity"]["sha256"] == eftfitter.sha256_file(workspace)
+    assert eftfitter._semantic_argv(command) == provenance["semantic_argv"]
+    attempt = json.loads(
+        (directories[0] / "attempts" / "attempt_0001.json").read_text(
+            encoding="utf-8"
+        )
     )
+    assert attempt["job_set_id"] == provenance["job_set_id"]
+    assert attempt["reason"] == "initial_submission"
+    assert attempt["member_set"] == provenance["expected_members"]
 
 
-def test_non_1d_grid_scan_retains_legacy_identity_path(
+def test_same_path_changed_bytes_changes_job_identity_and_stales_record(
     eftfitter, tmp_path, monkeypatch
+):
+    workspace, _ = prepare_directory(tmp_path, monkeypatch)
+    first = eftfitter._build_condor_provenance(
+        ".provenance.c_one", base_condor_argv(workspace), 20, 10
+    )
+    first_identity = dict(first["workspace_identity"])
+    same = eftfitter._build_condor_provenance(
+        ".provenance.c_one", base_condor_argv(workspace), 20, 10
+    )
+    assert same["job_set_id"] == first["job_set_id"]
+    workspace.write_bytes(b"changed workspace bytes")
+    changed = eftfitter._build_condor_provenance(
+        ".provenance.c_one", base_condor_argv(workspace), 20, 10
+    )
+    assert changed["job_set_id"] != first["job_set_id"]
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        eftfitter.validate_workspace_identity(first_identity)
+
+
+@pytest.mark.parametrize("workspace_state", ["correct", "changed", "missing"])
+def test_worker_guard_runs_fit_only_for_exact_workspace(
+    eftfitter, tmp_path, monkeypatch, workspace_state
+):
+    workspace, _ = prepare_directory(tmp_path, monkeypatch)
+    provenance = make_condor_provenance(eftfitter, workspace)
+    shell_path = Path(provenance["initial_scheduler_artifacts"][0])
+    binary_directory = tmp_path / "bin"
+    binary_directory.mkdir()
+    marker = tmp_path / "fit-invoked"
+    combine = binary_directory / "combine"
+    combine.write_text(
+        "#!/bin/sh\nprintf invoked > \"{}\"\n".format(marker), encoding="utf-8"
+    )
+    combine.chmod(0o755)
+    if workspace_state == "changed":
+        workspace.write_bytes(b"changed")
+    elif workspace_state == "missing":
+        workspace.unlink()
+    environment = os.environ.copy()
+    environment["PATH"] = "{}:{}".format(binary_directory, environment["PATH"])
+    result = subprocess.run([str(shell_path.resolve())], env=environment, check=False)
+    assert (result.returncode == 0) == (workspace_state == "correct")
+    assert marker.exists() == (workspace_state == "correct")
+
+
+def test_distinct_job_identities_coexist(eftfitter, tmp_path, monkeypatch):
+    workspace, _ = prepare_directory(tmp_path, monkeypatch)
+    first = make_condor_provenance(eftfitter, workspace)
+    workspace.write_bytes(b"different")
+    second = make_condor_provenance(eftfitter, workspace)
+    assert first["execution_directory"] != second["execution_directory"]
+    assert Path(first["execution_directory"]).is_dir()
+    assert Path(second["execution_directory"]).is_dir()
+
+
+def test_recovery_targets_only_unresolved_members_and_preserves_identity(
+    eftfitter, tmp_path, monkeypatch
+):
+    workspace, _ = prepare_directory(tmp_path, monkeypatch)
+    provenance = make_condor_provenance(eftfitter, workspace)
+    completed = Path(provenance["execution_directory"]) / provenance["expected_members"][0][
+        "file_name"
+    ]
+    completed.write_bytes(b"valid result")
+    completed_identity = eftfitter.file_identity(completed)
+    recorder = RecordingSubprocess()
+    monkeypatch.setattr(eftfitter, "sp", recorder)
+
+    attempt = make_fitter(eftfitter).recoverGridScan(
+        provenance["scan_name"], provenance["job_set_id"]
+    )
+
+    assert attempt["attempt_id"] == "attempt_0002"
+    assert attempt["job_set_id"] == provenance["job_set_id"]
+    assert attempt["reason"] == "recovery_missing_members"
+    assert attempt["member_set"] == [provenance["expected_members"][1]]
+    assert eftfitter.file_identity(completed) == completed_identity
+    submit = Path(attempt["scheduler_artifacts"][1]).read_text(encoding="utf-8")
+    assert "arguments = $(logical_member)" in submit
+    assert "queue logical_member from (\n1\n)" in submit
+    assert submit.count("requestMemory") == 1
+    assert submit.count("+JobFlavour") == 1
+    assert sum(call[0] == "condor_submit" for call in recorder.popen_calls) == 1
+
+
+def test_recovery_rejects_changed_workspace_without_submission(
+    eftfitter, tmp_path, monkeypatch
+):
+    workspace, _ = prepare_directory(tmp_path, monkeypatch)
+    provenance = make_condor_provenance(eftfitter, workspace)
+    workspace.write_bytes(b"changed")
+    recorder = RecordingSubprocess()
+    monkeypatch.setattr(eftfitter, "sp", recorder)
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        make_fitter(eftfitter).recoverGridScan(
+            provenance["scan_name"], provenance["job_set_id"]
+        )
+    assert recorder.popen_calls == []
+    assert not (Path(provenance["attempts_directory"]) / "attempt_0002.json").exists()
+
+
+def test_recovery_noop_when_all_members_are_valid(eftfitter, tmp_path, monkeypatch):
+    workspace, _ = prepare_directory(tmp_path, monkeypatch)
+    provenance = make_condor_provenance(eftfitter, workspace)
+    create_expected_outputs(provenance)
+    recorder = RecordingSubprocess()
+    monkeypatch.setattr(eftfitter, "sp", recorder)
+    assert make_fitter(eftfitter).recoverGridScan(
+        provenance["scan_name"], provenance["job_set_id"]
+    ) is None
+    assert recorder.popen_calls == []
+
+
+def test_duplicate_successful_member_identity_fails_closed(
+    eftfitter, tmp_path, monkeypatch
+):
+    workspace, _ = prepare_directory(tmp_path, monkeypatch)
+    provenance = make_condor_provenance(eftfitter, workspace)
+    paths = create_expected_outputs(provenance)
+    paths[1].unlink()
+    os.link(paths[0], paths[1])
+    with pytest.raises(RuntimeError, match="duplicate files"):
+        eftfitter._inspect_condor_members(provenance)
+
+
+def test_retrieval_requires_complete_members(eftfitter, tmp_path, monkeypatch):
+    workspace, _ = prepare_directory(tmp_path, monkeypatch)
+    provenance = make_condor_provenance(eftfitter, workspace)
+    paths = create_expected_outputs(provenance)
+    paths[-1].unlink()
+    recorder = RecordingSubprocess()
+    monkeypatch.setattr(eftfitter, "sp", recorder)
+    with pytest.raises(RuntimeError, match="membership is incomplete"):
+        make_fitter(eftfitter).retrieveGridScan(
+            provenance["scan_name"],
+            "condor",
+            require_condor_provenance=True,
+            job_set_id=provenance["job_set_id"],
+        )
+    assert recorder.popen_calls == []
+    assert paths[0].is_file()
+
+
+def test_retrieval_publishes_byte_bound_canonical_and_preserves_members(
+    eftfitter, tmp_path, monkeypatch
+):
+    workspace, fit_directory = prepare_directory(tmp_path, monkeypatch)
+    provenance = make_condor_provenance(eftfitter, workspace)
+    members = create_expected_outputs(provenance)
+    recorder = RecordingSubprocess(aggregate_bytes=b"canonical aggregate")
+    monkeypatch.setattr(eftfitter, "sp", recorder)
+    canonical = make_fitter(eftfitter).retrieveGridScan(
+        provenance["scan_name"],
+        "condor",
+        require_condor_provenance=True,
+        job_set_id=provenance["job_set_id"],
+    )
+    canonical = Path(canonical)
+    assert canonical.parent == fit_directory.resolve()
+    assert provenance["job_set_id"] in canonical.name
+    assert canonical.read_bytes() == b"canonical aggregate"
+    assert all(path.is_file() for path in members)
+    final = json.loads(
+        Path(str(canonical) + ".provenance.json").read_text(encoding="utf-8")
+    )
+    assert final["job_set_id"] == provenance["job_set_id"]
+    assert final["canonical_aggregate_sha256"] == eftfitter.sha256_file(canonical)
+    assert final["canonical_aggregate_size"] == canonical.stat().st_size
+    assert [item["attempt_id"] for item in final["attempt_history_references"]] == [
+        "attempt_0001"
+    ]
+
+
+def test_same_identity_equal_candidate_is_noop_and_different_candidate_fails(
+    eftfitter, tmp_path, monkeypatch
+):
+    workspace, _ = prepare_directory(tmp_path, monkeypatch)
+    provenance = make_condor_provenance(eftfitter, workspace)
+    create_expected_outputs(provenance)
+    first_recorder = RecordingSubprocess(aggregate_bytes=b"same")
+    monkeypatch.setattr(eftfitter, "sp", first_recorder)
+    fitter = make_fitter(eftfitter)
+    canonical = Path(
+        fitter.retrieveGridScan(
+            provenance["scan_name"],
+            "condor",
+            require_condor_provenance=True,
+            job_set_id=provenance["job_set_id"],
+        )
+    )
+    first_identity = eftfitter.file_identity(canonical)
+    monkeypatch.setattr(eftfitter, "sp", RecordingSubprocess(aggregate_bytes=b"same"))
+    assert Path(
+        fitter.retrieveGridScan(
+            provenance["scan_name"],
+            "condor",
+            require_condor_provenance=True,
+            job_set_id=provenance["job_set_id"],
+        )
+    ) == canonical
+    assert eftfitter.file_identity(canonical) == first_identity
+    monkeypatch.setattr(
+        eftfitter, "sp", RecordingSubprocess(aggregate_bytes=b"different")
+    )
+    with pytest.raises(RuntimeError, match="different bytes"):
+        fitter.retrieveGridScan(
+            provenance["scan_name"],
+            "condor",
+            require_condor_provenance=True,
+            job_set_id=provenance["job_set_id"],
+        )
+    assert eftfitter.file_identity(canonical) == first_identity
+
+
+def test_failed_aggregation_preserves_members(eftfitter, tmp_path, monkeypatch):
+    workspace, _ = prepare_directory(tmp_path, monkeypatch)
+    provenance = make_condor_provenance(eftfitter, workspace)
+    members = create_expected_outputs(provenance)
+    monkeypatch.setattr(
+        eftfitter, "sp", RecordingSubprocess(aggregation_return_code=1)
+    )
+    with pytest.raises(RuntimeError, match="aggregation failed"):
+        make_fitter(eftfitter).retrieveGridScan(
+            provenance["scan_name"],
+            "condor",
+            require_condor_provenance=True,
+            job_set_id=provenance["job_set_id"],
+        )
+    assert all(path.is_file() for path in members)
+
+
+@pytest.mark.parametrize(
+    "initial,overwrite,return_code,replacement,expected,raises",
+    [
+        (None, False, 0, b"new", b"new", False),
+        (b"old", False, 0, b"new", b"old", True),
+        (b"old", True, 0, b"new", b"new", False),
+        (b"old", True, 7, b"new", b"old", True),
+        (b"old", True, 0, b"", b"old", True),
+    ],
+)
+def test_make_workspace_eft_fail_closed_overwrite_lifecycle(
+    eftfitter,
+    tmp_path,
+    monkeypatch,
+    initial,
+    overwrite,
+    return_code,
+    replacement,
+    expected,
+    raises,
 ):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CMSSW_BASE", str(tmp_path / "cmssw"))
-    workspace = tmp_path / "workspace.root"
-    workspace.write_bytes(b"synthetic")
-    recorder = RecordingSubprocess()
-    monkeypatch.setattr(eftfitter, "sp", recorder)
-
-    make_fitter(eftfitter).gridScan(
-        name=".legacy.two_dimensional",
-        batch="condor",
-        scan_params=["c_one", "c_two"],
-        points=20,
-        workspace=str(workspace),
+    Path("card.txt").write_text("card", encoding="utf-8")
+    target = Path("workspace.root")
+    if initial is not None:
+        target.write_bytes(initial)
+    recorder = RecordingSubprocess(
+        workspace_return_code=return_code,
+        workspace_bytes=replacement,
     )
-
-    command = next(call for call in recorder.popen_calls if call[0] == "combineTool.py")
-    assert command[command.index("-n") + 1] == ".legacy.two_dimensional"
-    assert command[command.index("--task-name") + 1] == "legacytwo_dimensional"
-    assert not (tmp_path / "condor.legacy.two_dimensional" / "execution_provenance.json").exists()
-
-
-def test_missing_expected_output_fails_closed(eftfitter, tmp_path, monkeypatch):
-    prepare_retrieval_directory(tmp_path, monkeypatch)
-    provenance = make_condor_provenance(eftfitter)
-    expected_paths = create_expected_outputs(provenance)
-    expected_paths[-1].unlink()
-    recorder = RecordingSubprocess()
     monkeypatch.setattr(eftfitter, "sp", recorder)
-
-    with pytest.raises(RuntimeError, match="incomplete or ambiguous"):
-        make_fitter(eftfitter).retrieveGridScan(provenance["scan_name"], "condor")
-
-    assert recorder.popen_calls == []
-    assert expected_paths[0].is_file()
-
-
-def test_duplicate_output_identity_fails_closed(eftfitter, tmp_path, monkeypatch):
-    prepare_retrieval_directory(tmp_path, monkeypatch)
-    provenance = make_condor_provenance(eftfitter)
-    expected_paths = create_expected_outputs(provenance)
-    expected_paths[-1].unlink()
-    os.link(expected_paths[0], expected_paths[-1])
-    recorder = RecordingSubprocess()
-    monkeypatch.setattr(eftfitter, "sp", recorder)
-
-    with pytest.raises(RuntimeError, match="duplicate files"):
-        make_fitter(eftfitter).retrieveGridScan(provenance["scan_name"], "condor")
-
-    assert recorder.popen_calls == []
-    assert all(path.exists() for path in expected_paths)
-
-
-def test_stale_identity_metadata_fails_closed(eftfitter, tmp_path, monkeypatch):
-    prepare_retrieval_directory(tmp_path, monkeypatch)
-    provenance = make_condor_provenance(eftfitter)
-    create_expected_outputs(provenance)
-    provenance_path = (
-        Path(provenance["execution_directory"]) / "execution_provenance.json"
+    operation = lambda: make_fitter(eftfitter).makeWorkspaceEFT(
+        datacard="card.txt",
+        output=str(target),
+        overwrite=overwrite,
+        text2workspace_executable="fake-text2workspace",
     )
-    data = json.loads(provenance_path.read_text(encoding="utf-8"))
-    data["job_set_id"] = "0" * 64
-    provenance_path.write_text(json.dumps(data), encoding="utf-8")
-    recorder = RecordingSubprocess()
-    monkeypatch.setattr(eftfitter, "sp", recorder)
+    if raises:
+        with pytest.raises(RuntimeError):
+            operation()
+    else:
+        identity = operation()
+        assert identity["sha256"] == eftfitter.sha256_file(target)
+    assert target.read_bytes() == expected
+    assert list(tmp_path.glob(".workspace.root.*.tmp")) == []
+    if recorder.popen_calls:
+        command = recorder.popen_calls[0]
+        output_index = command.index("-o")
+        assert command[:output_index] == [
+            "fake-text2workspace",
+            "card.txt",
+            "-P",
+            "EFTFit.Fitter.EFTModel:eftmodel",
+            "--PO",
+            "fits={}/src/EFTFit/Fitter/hist_files/EFT_Parameterization.npy".format(
+                tmp_path / "cmssw"
+            ),
+        ]
+        assert command[output_index + 2 :] == ["--channel-masks"]
 
-    with pytest.raises(RuntimeError, match="stale or mismatched"):
-        make_fitter(eftfitter).retrieveGridScan(provenance["scan_name"], "condor")
 
-    assert recorder.popen_calls == []
-
-
-def test_failed_aggregation_preserves_sources(eftfitter, tmp_path, monkeypatch):
-    prepare_retrieval_directory(tmp_path, monkeypatch)
-    provenance = make_condor_provenance(eftfitter)
-    expected_paths = create_expected_outputs(provenance)
-    recorder = RecordingSubprocess(aggregation_return_code=1)
-    monkeypatch.setattr(eftfitter, "sp", recorder)
-
-    with pytest.raises(RuntimeError, match="aggregation failed"):
-        make_fitter(eftfitter).retrieveGridScan(provenance["scan_name"], "condor")
-
-    assert all(path.is_file() for path in expected_paths)
-
-
-def test_crab_resubmission_uses_submission_task_identity(
-    eftfitter, monkeypatch
-):
+def test_crab_resubmission_retains_existing_task_identity(eftfitter, monkeypatch):
     recorder = RecordingSubprocess()
     monkeypatch.setattr(eftfitter, "sp", recorder)
     make_fitter(eftfitter).batchResubmit1DScansEFT(
-        basename=".provenance",
-        scan_wcs=["c_one"],
+        basename=".provenance", scan_wcs=["c_one"]
     )
-
-    scan_name = eftfitter._one_dimensional_scan_name(".provenance", "c_one")
-    expected_project = "crab_{}".format(
-        eftfitter._scheduler_task_label(scan_name)
-    )
-    assert recorder.popen_calls == [["crab", "resubmit", expected_project]]
+    assert recorder.popen_calls == [["crab", "resubmit", "crab_provenancec_one"]]
