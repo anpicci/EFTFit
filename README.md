@@ -86,6 +86,45 @@ Now we can actually run combine to perform the fits.
     fitter.batchRetrieve1DScansEFT(basename='.081921.njet.ptbl.Float', batch='condor')
     ````
 
+#### Configured WC ranges and legacy compatibility
+
+`batch1DScanEFT` has two distinct range-selection modes. The mode is selected
+by whether a `fit_config` is supplied.
+
+With `fit_config=<path>`, the analysis-owned fit configuration is the single
+authority for the scientific WC population, fixed-zero population, and
+scientific fit ranges. `scan_wcs` selects only the invocation-local scan
+subset; it does not select or narrow the configured range map. EFTFit
+validates and materializes that metadata, but does not provide analysis range
+defaults in this mode.
+
+In configured mode, `wc_ranges` is a legacy range-authority control and must
+remain `None`; a non-`None` value is rejected. Caller-supplied
+`--setParameterRanges` entries for configured scientific WCs are checked
+against the fit configuration: semantically identical direct values are
+canonicalized, conflicts fail closed, and scientific regex selectors are
+rejected. Non-colliding controls for unrelated parameters are preserved.
+
+With `fit_config=None`, the historical legacy controls remain available:
+
+- `wc_ranges=None` selects the maintained default `wc_ranges_njets` table.
+- `wc_ranges=True` selects the maintained differential
+  `wc_ranges_differential` table.
+- An explicit legacy range mapping remains supported for the scanned WCs.
+
+This gives existing unconfigured callers a stable compatibility path while
+preventing the legacy tables from becoming a second scientific authority for a
+configured analysis. Migrate a historical invocation by moving its scientific
+population and range map into the analysis `fit_config`; keep `scan_wcs` only
+as the runtime scan selection. The historical TOP-26-006 workflow used
+`wc_ranges=True`, so its historical numerical provenance is the differential
+legacy table. Corrected analysis values belong in `TOP_26_006.yml` and are
+intentionally not repeated here.
+
+Legacy tables remain for callers without a `fit_config`. Remove a legacy
+surface only after each affected consumer has an explicit successor or an
+evidence-backed intentional retirement.
+
 #### Plot making
 
 To make simple 1D plots, use:

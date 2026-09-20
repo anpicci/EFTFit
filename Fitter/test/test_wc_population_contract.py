@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 import sys
 
@@ -55,6 +56,41 @@ def parse_ranges(value):
         parameter, bounds = assignment.split("=", 1)
         ranges[parameter] = tuple(float(bound) for bound in bounds.split(","))
     return ranges
+
+
+def load_batch_1d_scan_method():
+    script_path = FITTER_DIR / "scripts" / "EFTFitter.py"
+    tree = ast.parse(script_path.read_text(encoding="utf-8"))
+    fitter_class = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "EFTFit"
+    )
+    method = next(
+        node
+        for node in fitter_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "batch1DScanEFT"
+    )
+    namespace = {
+        "load_fit_config": load_fit_config,
+        "resolve_scan_wcs": resolve_scan_wcs,
+    }
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(script_path), "exec"),
+        namespace,
+    )
+    return namespace["batch1DScanEFT"]
+
+
+class RecordingBatchFitter:
+    batch1DScanEFT = load_batch_1d_scan_method()
+
+    def __init__(self):
+        self.wcs = ["legacy_one"]
+        self.wc_ranges_njets = {"legacy_one": (-11.0, 11.0)}
+        self.wc_ranges_differential = {"legacy_one": (-22.0, 22.0)}
+        self.grid_scan_calls = []
+
+    def gridScan(self, *args, **kwargs):
+        self.grid_scan_calls.append((args, kwargs))
 
 
 def test_profiled_one_wc_materializes_configured_population(tmp_path):
@@ -376,3 +412,39 @@ def test_scientific_range_regex_collision_is_rejected(tmp_path):
             scan_params=["c_one"],
             other=["--setParameterRanges", "rgx{c_.*}=-1,1"],
         )
+
+
+def test_configured_batch_rejects_legacy_range_control(tmp_path):
+    fitter = RecordingBatchFitter()
+    with pytest.raises(ValueError, match="cannot override configured WC ranges"):
+        fitter.batch1DScanEFT(
+            scan_wcs=["c_one"],
+            fit_config=write_config(tmp_path),
+            wc_ranges=True,
+        )
+    assert fitter.grid_scan_calls == []
+
+
+@pytest.mark.parametrize(
+    "wc_ranges,expected_range",
+    [
+        (None, "legacy_one=-11.0,11.0"),
+        (True, "legacy_one=-22.0,22.0"),
+    ],
+)
+def test_legacy_batch_selects_maintained_range_table(wc_ranges, expected_range):
+    fitter = RecordingBatchFitter()
+    fitter.batch1DScanEFT(scan_wcs=["legacy_one"], wc_ranges=wc_ranges)
+    arguments, keyword_arguments = fitter.grid_scan_calls[0]
+    assert arguments[6][0] == "--setParameterRanges {}".format(expected_range)
+    assert keyword_arguments == {}
+
+
+def test_legacy_batch_accepts_explicit_range_mapping():
+    fitter = RecordingBatchFitter()
+    fitter.batch1DScanEFT(
+        scan_wcs=["legacy_one"],
+        wc_ranges={"legacy_one": (-33.0, 33.0)},
+    )
+    arguments, _ = fitter.grid_scan_calls[0]
+    assert arguments[6][0] == "--setParameterRanges legacy_one=-33.0,33.0"
