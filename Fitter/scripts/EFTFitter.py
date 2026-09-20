@@ -911,19 +911,15 @@ class EFTFit(object):
                 raise ValueError('ignore cannot override configured WC populations')
             if wc_val is not None:
                 raise ValueError('wc_val is not supported with configured WC populations')
+            if wc_ranges is not None:
+                raise ValueError('wc_ranges cannot override configured WC ranges')
 
-            if wc_ranges is None: wc_ranges = self.wc_ranges_njets
-            if wc_ranges is True: wc_ranges = self.wc_ranges_differential
             for wc in scan_wcs:
                 if isinstance(mask, list) and len(mask)==1:
                     masks = mask[0]
                 else:
                     masks = ','.join(mask)
-                configured_other = [
-                    '--setParameterRanges {}={},{}'.format(
-                        wc, wc_ranges[wc][0], wc_ranges[wc][1]
-                    )
-                ] + list(other)
+                configured_other = list(other)
                 if masks:
                     configured_other.extend(['--setParameters', masks])
                 self.gridScan(

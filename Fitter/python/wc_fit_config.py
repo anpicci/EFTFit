@@ -1,6 +1,7 @@
 """Load and materialize analysis-owned WC population configuration."""
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 import re
 
@@ -11,6 +12,7 @@ _CONTROL_OPTIONS = {
     "--redefineSignalPOIs",
     "--floatOtherPOIs",
     "--freezeParameters",
+    "--setParameterRanges",
     "--setParameters",
 }
 
@@ -20,6 +22,7 @@ class WCFitConfig:
     analysis: str
     scientific_wcs: tuple
     fixed_wcs: tuple
+    wc_ranges: dict
 
 
 def validate_wc_population(scientific_wcs, fixed_wcs):
@@ -45,14 +48,58 @@ def validate_wc_population(scientific_wcs, fixed_wcs):
     return scientific, fixed
 
 
+def validate_wc_ranges(wc_ranges, scientific_wcs):
+    """Validate and order the configured fit ranges by scientific WC order."""
+    if not isinstance(wc_ranges, dict):
+        raise ValueError("wc_ranges must be a mapping")
+
+    scientific = tuple(scientific_wcs)
+    missing = set(scientific) - set(wc_ranges)
+    extra = set(wc_ranges) - set(scientific)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append("missing: {}".format(",".join(sorted(missing))))
+        if extra:
+            details.append("extra: {}".format(",".join(sorted(extra))))
+        raise ValueError(
+            "wc_ranges keys must exactly match scientific WCs ({})".format(
+                "; ".join(details)
+            )
+        )
+
+    validated = {}
+    for wc in scientific:
+        bounds = wc_ranges[wc]
+        if not isinstance(bounds, list) or len(bounds) != 2:
+            raise ValueError("wc_ranges.{} must be a two-element list".format(wc))
+        if not all(
+            isinstance(bound, (int, float))
+            and not isinstance(bound, bool)
+            and math.isfinite(bound)
+            for bound in bounds
+        ):
+            raise ValueError("wc_ranges.{} bounds must be finite numbers".format(wc))
+        if bounds[0] >= bounds[1]:
+            raise ValueError("wc_ranges.{} lower bound must be below upper bound".format(wc))
+        validated[wc] = tuple(bounds)
+    return validated
+
+
 def load_fit_config(path):
     """Load the minimal per-analysis YAML fit configuration at ``path``."""
     config_path = Path(path)
     with config_path.open(encoding="utf-8") as stream:
         data = yaml.safe_load(stream)
 
-    if not isinstance(data, dict) or set(data) != {"analysis", "wc_population"}:
-        raise ValueError("fit config must contain only analysis and wc_population")
+    if not isinstance(data, dict) or set(data) != {
+        "analysis",
+        "wc_population",
+        "wc_ranges",
+    }:
+        raise ValueError(
+            "fit config must contain only analysis, wc_population, and wc_ranges"
+        )
     if not isinstance(data["analysis"], str) or not data["analysis"]:
         raise ValueError("analysis must be a non-empty string")
     population = data["wc_population"]
@@ -64,7 +111,8 @@ def load_fit_config(path):
     scientific, fixed = validate_wc_population(
         population["scientific"], population["fixed_zero"]
     )
-    return WCFitConfig(data["analysis"], scientific, fixed)
+    wc_ranges = validate_wc_ranges(data["wc_ranges"], scientific)
+    return WCFitConfig(data["analysis"], scientific, fixed, wc_ranges)
 
 
 def resolve_scan_wcs(config, scan_wcs=None):
@@ -153,6 +201,52 @@ def _collect_control_values(arguments):
     return passthrough, controls
 
 
+def _parse_range_assignments(value):
+    assignments = []
+    for entry in value.split(":"):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            raise ValueError("invalid --setParameterRanges entry: {}".format(entry))
+        parameter, bounds_text = entry.split("=", 1)
+        parameter = parameter.strip()
+        bounds = [bound.strip() for bound in bounds_text.split(",")]
+        if not parameter or len(bounds) != 2:
+            raise ValueError("invalid --setParameterRanges entry: {}".format(entry))
+        try:
+            numeric_bounds = tuple(float(bound) for bound in bounds)
+        except ValueError:
+            raise ValueError(
+                "invalid --setParameterRanges bounds for {}".format(parameter)
+            )
+        if not all(math.isfinite(bound) for bound in numeric_bounds):
+            raise ValueError(
+                "invalid --setParameterRanges bounds for {}".format(parameter)
+            )
+        if numeric_bounds[0] >= numeric_bounds[1]:
+            raise ValueError(
+                "invalid --setParameterRanges bounds for {}".format(parameter)
+            )
+        assignments.append((parameter, numeric_bounds, bounds_text))
+    return assignments
+
+
+def _range_selector_matches_scientific(parameter, scientific_wcs):
+    if parameter in scientific_wcs:
+        return {parameter}
+    if parameter.startswith("rgx{") and parameter.endswith("}"):
+        expression = parameter[4:-1]
+        try:
+            matcher = re.compile(expression)
+        except re.error as error:
+            raise ValueError("invalid --setParameterRanges regex: {}".format(error))
+        return {wc for wc in scientific_wcs if matcher.fullmatch(wc)}
+    return set()
+
+
+def _format_bound(bound):
+    return str(bound)
+
+
 def normalize_configured_wc_controls(config, freeze, other=None):
     """Canonicalize authority-owned Combine controls and preserve other controls."""
     passthrough, controls = _collect_control_values(other)
@@ -160,6 +254,36 @@ def normalize_configured_wc_controls(config, freeze, other=None):
     fixed = tuple(config.fixed_wcs)
     scientific_set = set(scientific)
     fixed_set = set(fixed)
+
+    unrelated_ranges = []
+    unrelated_range_values = {}
+    for value in controls["--setParameterRanges"]:
+        for parameter, bounds, bounds_text in _parse_range_assignments(value):
+            matched_scientific = _range_selector_matches_scientific(
+                parameter, scientific_set
+            )
+            if matched_scientific:
+                if parameter.startswith("rgx{"):
+                    raise ValueError(
+                        "--setParameterRanges regex collides with configured scientific WCs"
+                    )
+                if bounds != tuple(config.wc_ranges[parameter]):
+                    raise ValueError(
+                        "--setParameterRanges contradicts configured range for {}".format(
+                            parameter
+                        )
+                    )
+                continue
+            if parameter in unrelated_range_values:
+                if unrelated_range_values[parameter] != bounds:
+                    raise ValueError(
+                        "conflicting --setParameterRanges entries for {}".format(
+                            parameter
+                        )
+                    )
+                continue
+            unrelated_range_values[parameter] = bounds
+            unrelated_ranges.append("{}={}".format(parameter, bounds_text))
 
     for value in controls["--redefineSignalPOIs"]:
         supplied = _parse_csv(value, "--redefineSignalPOIs")
@@ -235,6 +359,17 @@ def normalize_configured_wc_controls(config, freeze, other=None):
             "--freezeParameters",
             ",".join(list(fixed) + unrelated_freeze),
         ]
+    )
+    canonical_ranges = [
+        "{}={},{}".format(
+            wc,
+            _format_bound(config.wc_ranges[wc][0]),
+            _format_bound(config.wc_ranges[wc][1]),
+        )
+        for wc in scientific
+    ]
+    normalized.extend(
+        ["--setParameterRanges", ":".join(canonical_ranges + unrelated_ranges)]
     )
     return normalized
 
