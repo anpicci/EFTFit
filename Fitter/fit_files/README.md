@@ -1,20 +1,23 @@
-Merged Combine limits go here (from, for example,
-`batchRetrieve1DScansEFT`). Maintained 1D Condor results use the canonical
-identity-bearing form:
+# Maintained 1D fit results
 
-```
+This directory stores aggregates produced by maintained 1D Condor retrieval.
+The canonical result and its adjacent provenance sidecar are:
+
+```text
 higgsCombine<scan_name>.job_<full_job_set_id>.MultiDimFit.root
 higgsCombine<scan_name>.job_<full_job_set_id>.MultiDimFit.root.provenance.json
 ```
 
-The sidecar binds the exact result bytes, SHA-256-only workspace content
-identity, path-independent statistical invocation, expected members, and
-attempt history. Workspace paths remain provenance locators rather than
-logical identity. Sidecar validation recomputes `job_set_id` and validates the
-adjacent canonical file, so neither the original workspace path nor the
-original publication directory must exist after relocation. Consumers must
-resolve the canonical result through the repository helper. A scan with
-multiple valid identities requires an explicit `job_set_id`; no result is
-selected by mtime or name ordering. The historical stable filename is not
-persistent canonical state. It may be materialized only as a locked, transient
-relative symlink for one explicit compatibility operation.
+The sidecar binds the aggregate bytes, SHA-256 workspace content identity,
+path-independent statistical invocation, expected split members, and attempt
+history. A result is selected only after the sidecar and adjacent aggregate
+validate. When more than one valid identity exists for a scan name, the caller
+must supply the intended `job_set_id`; modification time and filename ordering
+are never selection rules.
+
+The pre-identity stable filename is not canonical state. It may exist only as
+a locked, relative, context-bounded compatibility link for a specialist
+consumer.
+
+See [current contracts](../../docs/reference/current_contracts.md) for the full
+execution, recovery, retrieval, and resolver contract.
