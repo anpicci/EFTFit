@@ -69,8 +69,25 @@ The accepted design is one self-contained package supporting both:
 
 The package also contains a package-local frozen fit config and one canonical
 manifest. A recipient does not need a `topeft` checkout. Exact compatible
-CMSSW, ROOT, CombinedLimit, CombineHarvester, and EFTFit software remains an
-explicit dependency; the design is not an offline container distribution.
+software remains an explicit dependency; the design is not an offline
+container distribution. The supported global EFTFit environment includes
+CMSSW, CombinedLimit, CombineHarvester, and EFTFit, with ROOT provided by the
+CMSSW environment.
+
+The portable-package dependency set is determined by the capabilities used by
+each declared reproduction path. The package manifest must record every exact
+compatible software component needed to reproduce each path. If any declared
+path uses CombineHarvester tools or functionality, exact compatible
+CombineHarvester software is mandatory package provenance and a dependency for
+that package. If no declared path uses it, CombineHarvester need not be a
+mandatory runtime dependency for that particular package path. Each future
+package version must re-evaluate its dependency set when its supported
+reproduction workflows change.
+
+The bounded observation that the previously inspected workspace-build and
+configured-fit paths did not require CombineHarvester remains valid only for
+those paths. It does not establish that CombineHarvester is globally excluded
+from portable-package dependencies or from the supported EFTFit environment.
 
 No package has yet been built, frozen, or recipient-qualified. No download or
 materialized package is implied by this design.
@@ -87,7 +104,7 @@ Until those items are closed:
 - old range numbers are not final authority;
 - configured 2D and impacts must not be advertised as runnable;
 - the portable package must not be advertised as available; and
-- unit/source evidence must not be described as exact-final statistical
+- unit/source evidence must not be described as final statistical
   qualification.
 
 Current postfit material is also historical. No accepted TOP-26-006 postfit
