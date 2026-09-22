@@ -1,7 +1,7 @@
 # Current contracts
 
-This page describes maintained behavior at the current lane_09 source state.
-It is a contract reference, not a second fit configuration.
+This page describes behavior supported by the maintained source. It is a
+contract reference, not a second fit configuration.
 
 ## Configured 1D scanning
 
@@ -14,8 +14,10 @@ fitter.batch1DScanEFT(..., fit_config="fit_config.yml")
 ```
 
 For the accepted TOP-26-006 population, the fit config identifies 26 scientific
-WCs and 10 technical fixed-zero WCs. It, not this page, owns their exact names,
-order, and numerical ranges.
+WCs and 10 technical fixed-zero WCs. It, not this page, owns their exact
+membership, scientific/fixed-zero disposition, and numerical ranges. The
+stored lists also provide deterministic technical serialization order; that
+order is not independent scientific authority.
 
 For each selected target:
 
@@ -41,13 +43,15 @@ wc_population.fixed_zero
 wc_ranges
 ```
 
-The two WC populations must be nonempty, ordered, duplicate-free, and
-disjoint. Range keys must exactly equal the scientific population, and every
-range must contain two finite increasing bounds.
+The two WC populations must be nonempty, duplicate-free, and disjoint. Their
+list order is retained for deterministic serialization, while membership and
+disposition define the scientific populations; reordering alone does not
+change that scientific meaning. Range keys must exactly equal the scientific
+membership set, and every range must contain two finite increasing bounds.
 
-The current TOP-26-006 numerical range payload is known to require correction
-while `topeft` remains frozen. No range numbers in old source, prose, or command
-examples are final authority.
+The current TOP-26-006 numerical range payload requires an analysis-owned
+correction and qualification update. No range numbers in old source, prose, or
+command examples are final authority.
 
 ## Configured and legacy range modes
 
@@ -87,6 +91,12 @@ Runtime checks are deliberately minimum sufficient: workers verify the input
 boundary, retrieval verifies the exact recorded member set, and consumers
 validate the selected canonical product. Workers do not reconstruct the full
 recipe or require an exact directory-content census.
+
+The recorded member set is strict: a missing or empty expected member,
+duplicate expected file identity, or conflicting member within the
+identity-owned result-name pattern fails retrieval. Files outside that owned
+pattern do not participate in result selection and do not fail retrieval merely
+because they share the directory.
 
 ## Retrieval and canonical results
 

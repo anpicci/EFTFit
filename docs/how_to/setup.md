@@ -3,16 +3,18 @@
 Status: **Implemented now**, with exact analysis/package qualification still
 required for final inference.
 
-EFTFit runs inside CMSSW with Combine. The locally accepted lane_09 baseline is:
+EFTFit runs inside CMSSW with CombinedLimit and CombineHarvester. The locally
+established reference environment is:
 
 ```text
 CMSSW release: CMSSW_14_1_0_pre4
 SCRAM_ARCH: el9_amd64_gcc12
 CombinedLimit tag: v10.5.1
+CombineHarvester tag: v3.1.0
 ```
 
-Create the CMSSW area outside a Conda environment and place CombinedLimit and
-EFTFit below its `src` directory:
+Create the CMSSW area outside a Conda environment and place CombinedLimit,
+CombineHarvester, and EFTFit below its `src` directory:
 
 ```bash
 export SCRAM_ARCH=el9_amd64_gcc12
@@ -22,18 +24,31 @@ cmsenv
 
 git clone https://github.com/cms-analysis/HiggsAnalysis-CombinedLimit.git HiggsAnalysis/CombinedLimit
 git -C HiggsAnalysis/CombinedLimit checkout v10.5.1
+git clone https://github.com/cms-analysis/CombineHarvester.git CombineHarvester
+git -C CombineHarvester checkout v3.1.0
 git clone https://github.com/TopEFT/EFTFit.git EFTFit
 
 scram b
 ```
 
-Select an EFTFit revision that has been reviewed for the analysis. The eventual
-portable package must record exact software revisions; the commands above do
-not by themselves qualify an exact-final TOP-26-006 environment.
+Select an EFTFit revision that has been reviewed for the analysis. The versions
+above record the current local reference environment, not universal package
+qualification. The eventual portable package must record and qualify all exact
+software revisions it uses; the commands above do not by themselves qualify an
+exact-final analysis environment.
 
 Do not use the repository `install.sh` for this maintained setup. It installs
 the older CMSSW 10_2_13 / CombinedLimit v8.2.0 workflow and is retained only as
-legacy source history.
+legacy source history. Likewise, historical custom CombineHarvester forks and
+CRAB-specific patches are not part of the maintained setup.
+
+CombineHarvester is part of the supported global EFTFit environment.
+`DatacardReader`, `CombineHelper`, and related utilities use its reusable
+datacard and Combine tooling, and maintained or future workflows should reuse
+that established functionality where appropriate. The configured 1D entry
+point in `EFTFitter.py` does not directly import CombineHarvester and may not
+exercise every CombineHarvester utility at runtime; that narrower call path
+does not make the global dependency legacy-only.
 
 ## Analysis-local inputs
 
@@ -42,9 +57,11 @@ The maintained configured 1D consumer needs:
 - a regular-file Combine workspace; and
 - a YAML fit configuration accepted by `Fitter/python/wc_fit_config.py`.
 
-The fit configuration owns the ordered scientific WC population, fixed-zero WC
-population, and the complete scientific range map. EFTFit does not ship the
-accepted final TOP-26-006 payload. The analysis must provide it after its
+The fit configuration owns scientific and fixed-zero WC membership and
+disposition, plus the complete scientific range map. Those are the scientific
+semantics. The lists retain a deterministic technical serialization order, but
+reordering alone is not a scientific-model change. EFTFit does not ship the
+accepted final analysis payload; the analysis must provide it after its
 numerical values are corrected, frozen, and qualified.
 
 To rebuild a workspace through the maintained interference-model helper, the
@@ -55,9 +72,12 @@ working directory must also contain analysis-supplied `combinedcard.txt` and
 source "$CMSSW_BASE/src/EFTFit/Fitter/scripts/text2workspace.sh" --output workspace.root
 ```
 
-The helper refuses to replace an existing target unless `--overwrite` is
-explicit. A failed or empty generation preserves the existing workspace. A
-workspace rebuild is not required when an already qualified frozen workspace
-is supplied.
+The helper defaults to `workspace.root` and supports `--output PATH`,
+`--overwrite`, and `--executable PATH`. It refuses to replace an existing
+regular target unless `--overwrite` is explicit and rejects non-regular or
+symlink targets. Generation occurs at a temporary same-directory path and is
+published only when the result is nonempty; failed or empty generation
+preserves an existing workspace. A rebuild is not required when an already
+qualified frozen workspace is supplied.
 
 Continue with [the configured 1D workflow](run_configured_1d.md).

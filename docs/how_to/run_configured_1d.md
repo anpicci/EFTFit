@@ -25,15 +25,18 @@ The fit configuration must have this schema:
 ```yaml
 analysis: <analysis_name>
 wc_population:
-  scientific: <ordered scientific WC list>
-  fixed_zero: <ordered technical fixed-zero WC list>
+  scientific: <scientific WC members in deterministic serialization order>
+  fixed_zero: <fixed-zero WC members in deterministic serialization order>
 wc_ranges: <mapping with exactly one entry per scientific WC>
 ```
 
 Do not copy WC lists or numerical ranges from documentation. The supplied fit
-configuration is their authority. For TOP-26-006, the accepted scientific
-population has 26 WCs and the technical fixed-zero population has 10 WCs, but
-the final numerical range payload is not yet frozen.
+configuration is their authority. Membership and scientific/fixed-zero
+disposition carry the scientific meaning; list order provides deterministic
+technical serialization and a pure reordering is not a scientific-model
+change. For TOP-26-006, the accepted scientific population has 26 WCs and the
+technical fixed-zero population has 10 WCs, but the final numerical range
+payload is not yet frozen.
 
 ## 2. Submit a configured scan
 
@@ -94,9 +97,14 @@ fitter.batchRetrieve1DScansEFT(
 )
 ```
 
-Retrieval fails before aggregation when an expected member is missing,
-duplicated, stale, unexpected, or inconsistent. The result is stored below
-`Fitter/fit_files` with its full `job_set_id` and adjacent provenance sidecar.
+Retrieval fails before aggregation when an expected identity-owned member is
+missing or empty, when expected members resolve to duplicate file identities,
+or when a conflicting member appears inside the recorded job set's owned
+result-name pattern. Wrong job-set identity or inconsistent provenance also
+fails. Unrelated files and artifacts in the directory do not participate in
+result selection and do not fail retrieval merely by existing. The result is
+stored below `Fitter/fit_files` with its full `job_set_id` and adjacent
+provenance sidecar.
 
 ## 5. Consume results
 

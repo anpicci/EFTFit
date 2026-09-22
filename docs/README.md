@@ -23,6 +23,10 @@ This is the canonical documentation index. Pages use these status labels:
 
 - [Design-closed features and exact-final limitations](explanation/pending_and_limitations.md)
 
+## Contributor planning
+
+- [EFTFit contributor roadmap](developers/roadmap.md)
+
 ## Historical material
 
 - [Legacy workflow index](historical/README.md)

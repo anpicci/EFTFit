@@ -27,10 +27,12 @@ The default `impacts_frozen` contract uses one scientific target per
 fit-producing job set: the target is active and reported, the other 25
 scientific WCs are fixed to zero, and all 10 technical WCs are fixed to zero.
 
-The optional `impacts_profiled` contract uses one ordered all-26-scientific-WC
-production. All scientific WCs remain active/profiled as appropriate, the 10
-technical WCs remain fixed to zero, and downstream target selection does not
-redefine the production population.
+The optional `impacts_profiled` contract uses the complete scientific-WC
+membership in one production. All scientific WCs remain active/profiled as
+appropriate, the 10 technical WCs remain fixed to zero, and downstream target
+selection does not redefine the production population. Deterministic
+serialization order is a technical requirement, not a separate scientific
+property of that population.
 
 For both modes:
 
@@ -39,15 +41,21 @@ For both modes:
 - non-WC impact parameters are the exact nonconstant RooRealVar nuisance
   population owned by the final workspace's `ModelConfig`, excluding both WC
   populations and other non-nuisance categories;
-- initial fit, nuisance fits, and collection bind the same target/POI state,
-  selector, dataset mode, range authority, and material fit options; and
+- shared semantic fields agree across stages wherever applicable, including
+  workspace identity, scientific POI/state definition, dataset definition,
+  range authority, nuisance-selector authority, and other cross-stage analysis
+  semantics;
+- stage-specific algorithm controls intentionally differ: `ImpactInitialFit`
+  is the fit-producing initial-fit stage, `ImpactNuisance` is the
+  fit-producing nuisance-impact stage, and `ImpactCollect` is an
+  aggregation/result-production stage with no fit lifecycle of its own; and
 - execution should generalize the maintained 1D `job_set_id`, `attempt_id`,
   expected-member, recovery, publication, and resolver lifecycle.
 
 The current `ImpactInitialFit`, `ImpactNuisance`, and `ImpactCollect` methods
 are legacy implementations with hard-coded lists, ranges, paths, and nuisance
 selection. They are not the configured TOP-26-006 workflow. The historical
-`ctW=1` assignment is an unintended test artifact and must not be reproduced.
+test-only nonzero WC assignment is unintended and must not be reproduced.
 
 ## Portable fit package
 
@@ -61,26 +69,20 @@ The accepted design is one self-contained package supporting both:
 
 The package also contains a package-local frozen fit config and one canonical
 manifest. A recipient does not need a `topeft` checkout. Exact compatible
-CMSSW, ROOT, CombinedLimit, and EFTFit software remains an explicit dependency;
-the design is not an offline container distribution.
+CMSSW, ROOT, CombinedLimit, CombineHarvester, and EFTFit software remains an
+explicit dependency; the design is not an offline container distribution.
 
 No package has yet been built, frozen, or recipient-qualified. No download or
 materialized package is implied by this design.
 
-## Limitations before exact-final TOP-26-006 inference
+## Current limitations
 
-The remaining ordered work is:
+The configured 2D and impacts consumers are not yet runnable, the portable fit
+package has not been materialized or qualified, and exact-model statistical
+validation remains future work. See the
+[contributor roadmap](../developers/roadmap.md) for status and dependency order.
 
-1. explicitly unlock `topeft`, correct the final numerical WC ranges, and
-   freeze the authoritative fit config;
-2. qualify the exact package-local fit-config bytes and final workspace/model
-   population;
-3. implement the configured 2D and impacts consumers without changing their
-   accepted semantics;
-4. materialize and recipient-qualify the portable fit package; and
-5. perform exact-final statistical validation.
-
-Until those gates pass:
+Until those items are closed:
 
 - old range numbers are not final authority;
 - configured 2D and impacts must not be advertised as runnable;
