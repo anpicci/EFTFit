@@ -2,6 +2,7 @@
 
 import ast
 import io
+import itertools
 import logging
 import os
 from pathlib import Path
@@ -48,7 +49,7 @@ def write_package(root):
     return root
 
 
-def load_batch_method():
+def load_batch_method(name="batch1DScanEFT"):
     script_path = FITTER_DIR / "scripts" / "EFTFitter.py"
     tree = ast.parse(script_path.read_text(encoding="utf-8"))
     fitter_class = next(
@@ -57,16 +58,17 @@ def load_batch_method():
     )
     method = next(
         node for node in fitter_class.body
-        if isinstance(node, ast.FunctionDef) and node.name == "batch1DScanEFT"
+        if isinstance(node, ast.FunctionDef) and node.name == name
     )
     namespace = {
         "WCFitConfig": WCFitConfig,
         "load_fit_config": load_fit_config,
         "load_fit_input_package": load_fit_input_package,
         "resolve_scan_wcs": resolve_scan_wcs,
+        "itertools": itertools,
     }
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(script_path), "exec"), namespace)
-    return namespace["batch1DScanEFT"]
+    return namespace[name]
 
 
 def load_grid_scan_method(namespace):
@@ -86,10 +88,13 @@ def load_grid_scan_method(namespace):
 
 class RecordingFitter:
     batch1DScanEFT = load_batch_method()
+    batch2DScanEFT = load_batch_method("batch2DScanEFT")
+    batch3DScanEFT = load_batch_method("batch3DScanEFT")
 
     def __init__(self):
         self.wcs = ["legacy_wc"]
         self.wc_ranges_njets = {"legacy_wc": (-9, 9)}
+        self.wc_ranges_differential = {"legacy_wc": (-8, 8)}
         self.grid_scan_calls = []
 
     def gridScan(self, *args, **kwargs):
@@ -289,3 +294,200 @@ def test_manifest_provenance_and_snapshot_do_not_gate_science(tmp_path):
         encoding="utf-8",
     )
     assert first == before == load_fit_input_package(package_root).fit_config
+
+
+def write_multidimensional_package(root):
+    package_root = write_package(root)
+    config_path = package_root / "config" / "TOP_26_006.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "analysis": "SYNTHETIC",
+                "wc_population": {
+                    "scientific": ["c_alpha", "c_beta", "c_gamma", "c_delta"],
+                    "fixed_zero": ["c_fixed"],
+                },
+                "wc_ranges": {
+                    "c_alpha": [-1, 2],
+                    "c_beta": [-3, 4],
+                    "c_gamma": [-5, 6],
+                    "c_delta": [-7, 8],
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return package_root
+
+
+def configured_argv(call):
+    _, keywords = call
+    return build_configured_grid_scan_command(
+        fit_config_path=keywords["fit_config"],
+        workspace=keywords["workspace"],
+        name=keywords["name"],
+        freeze=keywords["freeze"],
+        scan_params=keywords["scan_params"],
+        params_tracked=keywords["params_tracked"],
+        points=keywords["points"],
+        other=keywords["other"],
+    )
+
+
+def option_value(argv, option):
+    return argv[argv.index(option) + 1]
+
+
+@pytest.mark.parametrize("method", ["batch2DScanEFT", "batch3DScanEFT"])
+@pytest.mark.parametrize("selection", [{}, {"fit_config": None}])
+def test_multidimensional_selection_fails_closed(method, selection):
+    fitter = RecordingFitter()
+    with pytest.raises(ValueError, match="fit input/config selection must be explicit"):
+        getattr(fitter, method)(**selection)
+    assert fitter.grid_scan_calls == []
+
+
+@pytest.mark.parametrize("freeze", [False, True])
+def test_configured_2d_package_dispatch_uses_full_population(tmp_path, freeze):
+    package_root = write_multidimensional_package(tmp_path / "package")
+    fitter = RecordingFitter()
+    fitter.batch2DScanEFT(
+        fit_config="package",
+        fit_package_root=package_root,
+        wcs=[("c_alpha", "c_beta")],
+        freeze=freeze,
+        workspace="synthetic_workspace.root",
+        points=11,
+    )
+    assert len(fitter.grid_scan_calls) == 1
+    _, keywords = fitter.grid_scan_calls[0]
+    assert isinstance(keywords["fit_config"], WCFitConfig)
+    assert keywords["params_tracked"] == ["c_gamma", "c_delta"]
+    assert keywords["execution_provenance"] is True
+    argv = configured_argv(fitter.grid_scan_calls[0])
+    assert [argv[index + 1] for index, token in enumerate(argv[:-1]) if token == "-P"] == [
+        "c_alpha", "c_beta"
+    ]
+    assert option_value(argv, "--redefineSignalPOIs") == "c_alpha,c_beta,c_gamma,c_delta"
+    assert option_value(argv, "--trackParameters") == "c_gamma,c_delta"
+    assert option_value(argv, "--setParameterRanges") == (
+        "c_alpha=-1,2:c_beta=-3,4:c_gamma=-5,6:c_delta=-7,8"
+    )
+    assert option_value(argv, "--setParameters") == (
+        "c_alpha=0,c_beta=0,c_gamma=0,c_delta=0,c_fixed=0"
+    )
+    assert option_value(argv, "--freezeParameters") == "c_fixed"
+    assert ("--floatOtherPOIs" in argv) is not freeze
+    assert "legacy_wc" not in " ".join(argv)
+
+
+@pytest.mark.parametrize("pair", [
+    ("c_alpha", "c_alpha"),
+    ("c_alpha", "not_scientific"),
+    ("c_alpha", "c_fixed"),
+])
+def test_configured_2d_rejects_invalid_axes(tmp_path, pair):
+    config_path = write_multidimensional_package(tmp_path / "package") / "config" / "TOP_26_006.yml"
+    fitter = RecordingFitter()
+    with pytest.raises(ValueError):
+        fitter.batch2DScanEFT(fit_config=config_path, wcs=[pair])
+    assert fitter.grid_scan_calls == []
+
+
+def test_configured_2d_unique_pair_enumeration(tmp_path):
+    config = load_fit_input_package(write_multidimensional_package(tmp_path / "package")).fit_config
+    fitter = RecordingFitter()
+    fitter.batch2DScanEFT(fit_config=config, allPairs=True, wcs=["c_delta", "c_alpha", "c_beta"])
+    assert [call[1]["scan_params"] for call in fitter.grid_scan_calls] == [
+        ["c_delta", "c_alpha"], ["c_delta", "c_beta"], ["c_alpha", "c_beta"]
+    ]
+    assert all(call[1]["fit_config"].scientific_wcs == config.scientific_wcs for call in fitter.grid_scan_calls)
+
+
+def test_configured_2d_validates_all_pairs_before_dispatch(tmp_path):
+    config_path = write_multidimensional_package(tmp_path / "package") / "config" / "TOP_26_006.yml"
+    fitter = RecordingFitter()
+    with pytest.raises(ValueError, match="subset"):
+        fitter.batch2DScanEFT(
+            fit_config=config_path,
+            wcs=[("c_alpha", "c_beta"), ("c_alpha", "not_scientific")],
+        )
+    assert fitter.grid_scan_calls == []
+
+
+def test_legacy_2d_selection_preserves_range_table():
+    fitter = RecordingFitter()
+    fitter.wcs = ["legacy_wc", "second_wc"]
+    fitter.wc_ranges_differential["second_wc"] = (-6, 6)
+    fitter.batch2DScanEFT(fit_config="legacy", wcs=[("legacy_wc", "second_wc")])
+    assert fitter.grid_scan_calls[0][1]["fit_config"] == "legacy"
+    assert fitter.grid_scan_calls[0][1]["other"][0] == (
+        "--setParameterRanges legacy_wc=-8,8:second_wc=-6,6"
+    )
+
+
+def test_configured_3d_package_dispatch_uses_existing_grid_seam(tmp_path):
+    package_root = write_multidimensional_package(tmp_path / "package")
+    fitter = RecordingFitter()
+    fitter.batch3DScanEFT(
+        fit_config="package", fit_package_root=package_root,
+        wc_triplet=[("c_alpha", "c_beta", "c_gamma")],
+        workspace="synthetic_workspace.root", points=13,
+    )
+    assert len(fitter.grid_scan_calls) == 1
+    _, keywords = fitter.grid_scan_calls[0]
+    assert isinstance(keywords["fit_config"], WCFitConfig)
+    assert keywords["params_tracked"] == ["c_delta"]
+    assert keywords["execution_provenance"] is True
+    argv = configured_argv(fitter.grid_scan_calls[0])
+    assert option_value(argv, "--redefineSignalPOIs") == "c_alpha,c_beta,c_gamma,c_delta"
+    assert option_value(argv, "--setParameterRanges") == (
+        "c_alpha=-1,2:c_beta=-3,4:c_gamma=-5,6:c_delta=-7,8"
+    )
+    assert option_value(argv, "--freezeParameters") == "c_fixed"
+
+
+@pytest.mark.parametrize("triplet", [
+    ("c_alpha", "c_beta", "c_beta"),
+    ("c_alpha", "c_beta", "not_scientific"),
+    ("c_alpha", "c_beta", "c_fixed"),
+])
+def test_configured_3d_rejects_invalid_axes(tmp_path, triplet):
+    config = load_fit_input_package(write_multidimensional_package(tmp_path / "package")).fit_config
+    fitter = RecordingFitter()
+    with pytest.raises(ValueError):
+        fitter.batch3DScanEFT(fit_config=config, wc_triplet=[triplet])
+    assert fitter.grid_scan_calls == []
+
+
+def test_configured_3d_triplet_enumeration_is_deterministic(tmp_path):
+    config = load_fit_input_package(write_multidimensional_package(tmp_path / "package")).fit_config
+    fitter = RecordingFitter()
+    fitter.batch3DScanEFT(fit_config=config, allPairs=True)
+    assert [call[1]["scan_params"] for call in fitter.grid_scan_calls] == [
+        list(triplet) for triplet in itertools.combinations(config.scientific_wcs, 3)
+    ]
+
+
+def test_configured_3d_path_validates_all_triplets_before_dispatch(tmp_path):
+    config_path = write_multidimensional_package(tmp_path / "package") / "config" / "TOP_26_006.yml"
+    fitter = RecordingFitter()
+    with pytest.raises(ValueError, match="subset"):
+        fitter.batch3DScanEFT(
+            fit_config=config_path,
+            wc_triplet=[
+                ("c_alpha", "c_beta", "c_gamma"),
+                ("c_alpha", "c_beta", "not_scientific"),
+            ],
+        )
+    assert fitter.grid_scan_calls == []
+
+
+def test_legacy_3d_selection_preserves_explicit_triplet():
+    fitter = RecordingFitter()
+    triplet = ("legacy_wc", "second_wc", "third_wc")
+    fitter.wcs = list(triplet)
+    fitter.batch3DScanEFT(fit_config="legacy", wc_triplet=[triplet])
+    assert fitter.grid_scan_calls[0][1]["scan_params"] == list(triplet)
+    assert fitter.grid_scan_calls[0][1]["fit_config"] == "legacy"

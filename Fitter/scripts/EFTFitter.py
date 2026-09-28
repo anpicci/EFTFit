@@ -1937,8 +1937,60 @@ class EFTFit(object):
     example: `fitter.batch2DScanEFT('.test.ctZ', batch='crab', wcs='ctZ', workspace='wps_njet_runII.root')`
     '''
 
-    def batch2DScanEFT(self, basename='.EFT.gridScan', batch='crab', freeze=False, points=90000, allPairs=False, other=[], mask=[], mask_syst=[], wcs=[], workspace='EFTWorkspace.root', differential=None):
+    def batch2DScanEFT(self, basename='.EFT.gridScan', batch='crab', freeze=False, points=90000, allPairs=False, other=[], mask=[], mask_syst=[], wcs=[], workspace='EFTWorkspace.root', differential=None, fit_config=None, fit_package_root=None):
         ### For pairs of wcs, runs deltaNLL Scan in two wcs using CRAB or Condor ###
+        if fit_config is None:
+            raise ValueError('fit input/config selection must be explicit')
+        if fit_config == 'package':
+            fit_config = load_fit_input_package(fit_package_root).fit_config
+        elif fit_package_root is not None:
+            raise ValueError('fit_package_root requires package mode')
+        if fit_config != 'legacy':
+            config = fit_config if hasattr(fit_config, 'scientific_wcs') else load_fit_config(fit_config)
+            if differential is not None:
+                raise ValueError('differential cannot override configured WC ranges')
+            if allPairs:
+                scan_wcs = resolve_scan_wcs(config, wcs)
+                pairs = list(itertools.combinations(scan_wcs, 2))
+            else:
+                if not wcs:
+                    raise ValueError('configured 2D requires a pair selector or allPairs')
+                selectors = [wcs] if isinstance(wcs, str) else wcs
+                pairs = []
+                for selector in selectors:
+                    if isinstance(selector, str):
+                        pairs.extend((selector, wc) for wc in config.scientific_wcs if wc != selector)
+                    else:
+                        pairs.append(tuple(selector))
+            if not pairs:
+                raise ValueError('configured 2D requires at least one pair')
+            seen_pairs = set()
+            unique_pairs = []
+            for pair in pairs:
+                if len(pair) != 2 or len(set(pair)) != 2:
+                    raise ValueError('configured 2D pairs require two distinct WCs')
+                resolve_scan_wcs(config, pair)
+                pair_key = frozenset(pair)
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                unique_pairs.append(pair)
+            for pair in unique_pairs:
+                self.gridScan(
+                    name='{}.{}{}'.format(basename, pair[0], pair[1]),
+                    batch=batch,
+                    freeze=freeze,
+                    scan_params=list(pair),
+                    params_tracked=[wc for wc in config.scientific_wcs if wc not in pair],
+                    points=points,
+                    other=list(other),
+                    mask=mask,
+                    mask_syst=mask_syst,
+                    workspace=workspace,
+                    fit_config=config,
+                    execution_provenance=True,
+                )
+            return
         if differential is None:
             differential = 'njets' not in workspace
             print('Assuming')
@@ -1977,8 +2029,44 @@ class EFTFit(object):
                 #print(scan_wcs, wcs_tracked)
                 self.gridScan(name='{}.{}{}'.format(basename,wcs[0],wcs[1]), batch=batch, freeze=freeze, scan_params=list(wcs), params_tracked=wcs_tracked, points=points, other=['--setParameterRanges {}={},{}:{}={},{}'.format(wcs[0],wc_ranges[wcs[0]][0],wc_ranges[wcs[0]][1],wcs[1],wc_ranges[wcs[1]][0],wc_ranges[wcs[1]][1])]+other+['--setParameters', params], mask=mask, mask_syst=mask_syst, workspace=workspace, fit_config='legacy')
 
-    def batch3DScanEFT(self, basename='.EFT.gridScan', batch='crab', freeze=False, points=27000000, allPairs=False, other=[], wc_triplet=[], mask=[], mask_syst=[]):
+    def batch3DScanEFT(self, basename='.EFT.gridScan', batch='crab', freeze=False, points=27000000, allPairs=False, other=[], wc_triplet=[], mask=[], mask_syst=[], workspace='EFTWorkspace.root', fit_config=None, fit_package_root=None):
         ### For pairs of wcs, runs deltaNLL Scan in two wcs using CRAB or Condor ###
+        if fit_config is None:
+            raise ValueError('fit input/config selection must be explicit')
+        if fit_config == 'package':
+            fit_config = load_fit_input_package(fit_package_root).fit_config
+        elif fit_package_root is not None:
+            raise ValueError('fit_package_root requires package mode')
+        if fit_config != 'legacy':
+            config = fit_config if hasattr(fit_config, 'scientific_wcs') else load_fit_config(fit_config)
+            if allPairs:
+                triplets = list(itertools.combinations(config.scientific_wcs, 3))
+            else:
+                if not wc_triplet:
+                    raise ValueError('configured 3D requires a triplet selector or allPairs')
+                triplets = [wc_triplet] if isinstance(wc_triplet[0], str) else wc_triplet
+            if not triplets:
+                raise ValueError('configured 3D requires at least one triplet')
+            for triplet in triplets:
+                if len(triplet) != 3 or len(set(triplet)) != 3:
+                    raise ValueError('configured 3D triplets require three distinct WCs')
+                resolve_scan_wcs(config, triplet)
+            for triplet in triplets:
+                self.gridScan(
+                    name='{}.{}{}{}'.format(basename, *triplet),
+                    batch=batch,
+                    freeze=freeze,
+                    scan_params=list(triplet),
+                    params_tracked=[wc for wc in config.scientific_wcs if wc not in triplet],
+                    points=points,
+                    other=list(other),
+                    mask=mask,
+                    mask_syst=mask_syst,
+                    workspace=workspace,
+                    fit_config=config,
+                    execution_provenance=True,
+                )
+            return
 
         # Use EVERY combination of wcs
         if allPairs:
