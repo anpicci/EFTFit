@@ -70,6 +70,23 @@ The historical TOP-26-006 invocation used `wc_ranges=True`. That fact records
 legacy provenance; it does not make the legacy table the current configured
 analysis authority.
 
+## EFT workspace build receipt
+
+`Fitter/python/workspace_build_recipe.py --recipe <path>` constructs the EFT
+workspace command and prints one JSON receipt. `--receipt <path>` atomically
+writes the same receipt for a later workflow step. The receipt records the
+normalized model options, requested and resolved output paths, collision
+policy, final workspace SHA-256 and size, predecessor identity when replaced,
+and observed software commits for qualified builds. Optional
+`input.input_snapshot_sha256` in the recipe or
+`--input-snapshot-sha256 <value>` carries an upstream package identity into
+the receipt without recomputing it. The workspace SHA-256 remains the artifact
+identity; paths and software commits are provenance.
+
+This is the canonical command-construction owner for EFT/TOP-26-006 workspace
+builds. `EFTFitter.makeWorkspaceSM` remains a separate SM-specific path; this
+contract does not claim that all workspace modes are unified.
+
 ## Maintained 1D execution identity
 
 Status: **Implemented now** for the maintained Condor 1D path.

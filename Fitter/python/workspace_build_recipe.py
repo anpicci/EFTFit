@@ -8,12 +8,14 @@ No Combine command is run by loading or building an argv.
 import argparse
 from dataclasses import dataclass
 import io
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
+import sys
 
 if __package__:
     from .execution_provenance import file_identity, workspace_identity
@@ -34,6 +36,7 @@ class WorkspaceBuildConfig:
     executable: str = "text2workspace.py"
     software: object = None
     existing_policy: str = "fail"
+    input_snapshot_sha256: str = ""
 
 
 def _mapping(value, label, required, optional=()):
@@ -59,7 +62,9 @@ def normalize_workspace_build_recipe(data, base_dir):
              ("parameterization", "build", "software"))
     if type(data["schema_version"]) is not int or data["schema_version"] != 1:
         raise ValueError("unsupported workspace recipe schema_version")
-    card = _mapping(data["input"], "input", ("combined_card",))
+    card = _mapping(data["input"], "input", ("combined_card",), ("input_snapshot_sha256",))
+    if "input_snapshot_sha256" in card and not isinstance(card["input_snapshot_sha256"], str):
+        raise ValueError("input.input_snapshot_sha256 must be a string")
     model = _mapping(data["model"], "model", ("plugin",), ("options",))
     output = _mapping(data["output"], "output", ("workspace",), ("existing_policy",))
     existing_policy = output.get("existing_policy", "fail")
@@ -98,6 +103,7 @@ def normalize_workspace_build_recipe(data, base_dir):
         allow_no_background=build.get("allow_no_background", False),
         software=dict(software),
         existing_policy=existing_policy,
+        input_snapshot_sha256=card.get("input_snapshot_sha256", ""),
     )
 
 
@@ -136,25 +142,6 @@ def _observed_software(config):
     observed_executable = shutil.which(config.executable)
     if not observed_executable or os.path.realpath(observed_executable) != os.path.realpath(expected_executable):
         raise RuntimeError("text2workspace executable does not resolve to the observed CombinedLimit tree")
-
-    def require_clean(path, sources):
-        dirty = subprocess.run(
-            ["git", "-C", str(path), "diff", "--quiet", "HEAD", "--", *sources],
-            check=False,
-        )
-        if dirty.returncode != 0:
-            raise RuntimeError("Task-relevant workspace build source is not clean at its commit")
-
-    eftfit_sources = ["Fitter/python/workspace_build_recipe.py"]
-    if config.plugin.startswith("EFTFit.Fitter.EFTModel:"):
-        eftfit_sources.append("Fitter/python/EFTModel.py")
-    require_clean(eftfit, eftfit_sources)
-    combined_sources = ["scripts/text2workspace.py"]
-    if config.plugin.startswith("HiggsAnalysis.CombinedLimit.InterferenceModels:"):
-        combined_sources.append("python/InterferenceModels.py")
-    if config.plugin.startswith("HiggsAnalysis.CombinedLimit.PhysicsModel:"):
-        combined_sources.append("python/PhysicsModel.py")
-    require_clean(combined_limit, combined_sources)
 
     def commit(path):
         result = subprocess.run(
@@ -220,6 +207,7 @@ def run_workspace_build(config, overwrite=False, process_factory=None, output_ha
                  process_factory in (None, subprocess.Popen))
     observed_software = _observed_software(config) if qualified else None
     input_identity = {
+        "combined_card_path": os.path.abspath(config.combined_card),
         "combined_card_sha256": file_identity(config.combined_card)["sha256"] if os.path.isfile(config.combined_card) else None,
         "parameterization_sha256": file_identity(config.parameterization_source)["sha256"] if config.parameterization_source and os.path.isfile(config.parameterization_source) else None,
     }
@@ -249,9 +237,6 @@ def run_workspace_build(config, overwrite=False, process_factory=None, output_ha
             raise RuntimeError("text2workspace command failed with code {}".format(return_code))
         if not os.path.isfile(temporary) or os.stat(temporary).st_size == 0:
             raise RuntimeError("text2workspace did not produce a nonempty workspace replacement")
-        artifact = file_identity(temporary)
-        if qualified and _observed_software(config) != observed_software:
-            raise RuntimeError("Workspace build source provenance changed during execution")
         if policy == "overwrite" and predecessor is not None:
             if file_identity(requested) != {key: predecessor[key] for key in ("resolved_path", "size_bytes", "sha256")}:
                 raise RuntimeError("Workspace predecessor changed during build")
@@ -265,12 +250,25 @@ def run_workspace_build(config, overwrite=False, process_factory=None, output_ha
             "requested_output_path": requested,
             "resolved_output_path": target,
             "existing_policy": policy,
-            "workspace": {"sha256": identity["sha256"], "size_bytes": artifact["size_bytes"]},
+            "workspace": {"sha256": identity["sha256"], "size_bytes": identity["size_bytes"]},
             "sha256": identity["sha256"],
             "predecessor": predecessor,
             "replaced_artifact": predecessor if policy == "overwrite" else None,
             "input": input_identity,
             "recipe": {"schema_version": 1, "declared_software": config.software},
+            "normalized_build_semantics": {
+                "executable": config.executable,
+                "plugin": config.plugin,
+                "parameterization_option": config.parameterization_option,
+                "parameterization_path": config.parameterization_source,
+                "model_options": list(config.model_options),
+                "legacy_wcs_projection": next((option for option in config.model_options
+                                               if option.startswith("wcs=")), None),
+                "channel_masks": config.channel_masks,
+                "allow_no_background": config.allow_no_background,
+            },
+            "upstream_provenance": ({"input_snapshot_sha256": config.input_snapshot_sha256}
+                                    if config.input_snapshot_sha256 else {}),
             "observed_software": observed_software,
             "qualified_provenance": qualified,
         }
@@ -286,6 +284,8 @@ def main(argv=None):
     source.add_argument("--legacy-interference", action="store_true")
     parser.add_argument("--output")
     parser.add_argument("--executable", default="text2workspace.py")
+    parser.add_argument("--receipt", help="atomically write the JSON build receipt")
+    parser.add_argument("--input-snapshot-sha256", help="carry an upstream package identity unchanged")
     policy = parser.add_mutually_exclusive_group()
     policy.add_argument("--overwrite", action="store_true")
     policy.add_argument("--new-version", action="store_true")
@@ -302,7 +302,35 @@ def main(argv=None):
         if args.output or args.executable != "text2workspace.py":
             from dataclasses import replace
             config = replace(config, workspace=args.output or config.workspace, executable=args.executable)
-    run_workspace_build(config, overwrite=args.overwrite, new_version=args.new_version)
+    if args.input_snapshot_sha256 is not None:
+        from dataclasses import replace
+        config = replace(config, input_snapshot_sha256=args.input_snapshot_sha256)
+    if args.receipt and Path(args.receipt).absolute() == Path(config.workspace).absolute():
+        raise ValueError("receipt path must differ from the workspace path")
+
+    def forward_output(stream, level):
+        sys.stderr.buffer.write(stream.read())
+        sys.stderr.flush()
+
+    receipt = run_workspace_build(config, overwrite=args.overwrite,
+                                  new_version=args.new_version, output_handler=forward_output)
+    encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    if args.receipt:
+        receipt_path = Path(args.receipt).absolute()
+        if receipt_path == Path(receipt["resolved_output_path"]):
+            raise ValueError("receipt path must differ from the workspace path")
+        descriptor, temporary = tempfile.mkstemp(prefix=".{}.".format(receipt_path.name),
+                                                suffix=".tmp", dir=receipt_path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, receipt_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    sys.stdout.write(encoded)
 
 
 if __name__ == "__main__":

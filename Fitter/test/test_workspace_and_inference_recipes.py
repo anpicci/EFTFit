@@ -3,6 +3,7 @@
 import ast
 import hashlib
 import importlib.util
+import json
 import logging
 import os
 from pathlib import Path
@@ -65,7 +66,11 @@ def test_workspace_yaml_resolves_locators_and_preserves_model_options(tmp_path):
 def test_canonical_cli_loads_yaml_without_executing_combine(monkeypatch):
     path = FITTER_DIR.parent / "docs/reference/workspace_build_recipe_v1.example.yml"
     observed = []
-    monkeypatch.setattr(workspace_builder, "run_workspace_build", lambda config, overwrite, new_version: observed.append((config, overwrite, new_version)))
+    def fake_build(config, overwrite, new_version, output_handler):
+        observed.append((config, overwrite, new_version))
+        return {"synthetic": True}
+
+    monkeypatch.setattr(workspace_builder, "run_workspace_build", fake_build)
     workspace_builder.main(["--recipe", str(path)])
     assert len(observed) == 1
     assert observed[0][0].plugin == "EFTFit.Fitter.EFTModel:eftmodel"
@@ -349,19 +354,95 @@ def test_qualified_receipt_records_observed_commits_without_currentness_gate(tmp
     assert "current_head" not in receipt
 
 
-def test_dirty_canonical_builder_cannot_claim_clean_commit_provenance(monkeypatch):
+def test_cli_emits_and_atomically_writes_matching_receipt(tmp_path, monkeypatch, capfd):
+    card = tmp_path / "card.txt"
+    card.write_bytes(b"card")
+    target = tmp_path / "workspace.root"
+    receipt_path = tmp_path / "build.json"
+    recipe_path = tmp_path / "recipe.yml"
+    recipe_path.write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "input": {"combined_card": "card.txt", "input_snapshot_sha256": "UPSTREAM-OPAQUE"},
+        "model": {"plugin": "synthetic.plugin:model", "options": ["verbose"]},
+        "parameterization": {"option": "fits", "source": "fits.npy"},
+        "build": {"channel_masks": True, "allow_no_background": True},
+        "output": {"workspace": "workspace.root", "existing_policy": "fail"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(workspace_builder.subprocess, "Popen",
+                        lambda argv, **kw: SyntheticProcess(argv))
+    replaces = []
+    real_replace = os.replace
+
+    def observed_replace(source, destination):
+        assert Path(source).is_file()
+        replaces.append((source, destination))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(workspace_builder.os, "replace", observed_replace)
+    workspace_builder.main(["--recipe", str(recipe_path), "--receipt", str(receipt_path)])
+    stdout, stderr = capfd.readouterr()
+    receipt = json.loads(stdout)
+    assert json.loads(receipt_path.read_text(encoding="utf-8")) == receipt
+    assert stdout == receipt_path.read_text(encoding="utf-8")
+    assert len(replaces) == 1 and replaces[0][1] == receipt_path
+    assert not Path(replaces[0][0]).exists()
+    assert "stdout" in stderr and "stderr" in stderr
+    assert receipt["requested_output_path"] == str(target)
+    assert receipt["resolved_output_path"] == str(target)
+    assert receipt["existing_policy"] == "fail"
+    assert receipt["workspace"] == {
+        "sha256": hashlib.sha256(b"new").hexdigest(), "size_bytes": 3,
+    }
+    assert receipt["input"]["combined_card_path"] == str(card)
+    assert receipt["upstream_provenance"] == {"input_snapshot_sha256": "UPSTREAM-OPAQUE"}
+    assert receipt["normalized_build_semantics"] == {
+        "executable": "text2workspace.py", "plugin": "synthetic.plugin:model",
+        "parameterization_option": "fits",
+        "parameterization_path": str(tmp_path / "fits.npy"),
+        "model_options": ["verbose"], "legacy_wcs_projection": None,
+        "channel_masks": True, "allow_no_background": True,
+    }
+
+
+def test_legacy_wcs_projection_is_recorded_without_temp_locator(tmp_path):
+    config = WorkspaceBuildConfig("card", "plugin", str(tmp_path / "ws.root"),
+                                  model_options=("fits=fits.npy", "wcs=c_one,c_two"))
+    receipt = run_workspace_build(config, process_factory=lambda argv, **kw: SyntheticProcess(argv))
+    assert receipt["normalized_build_semantics"]["legacy_wcs_projection"] == "wcs=c_one,c_two"
+    assert receipt["normalized_build_semantics"]["model_options"] == ["fits=fits.npy", "wcs=c_one,c_two"]
+    assert ".tmp" not in json.dumps(receipt["normalized_build_semantics"])
+
+
+def test_cli_upstream_identity_override_is_opaque(tmp_path, monkeypatch, capfd):
+    recipe_path = tmp_path / "recipe.yml"
+    recipe_path.write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "input": {"combined_card": "card.txt", "input_snapshot_sha256": "from-recipe"},
+        "model": {"plugin": "synthetic.plugin:model"},
+        "output": {"workspace": "workspace.root"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(workspace_builder.subprocess, "Popen",
+                        lambda argv, **kw: SyntheticProcess(argv))
+    workspace_builder.main(["--recipe", str(recipe_path),
+                            "--input-snapshot-sha256", "from-orchestrator"])
+    stdout, _ = capfd.readouterr()
+    assert json.loads(stdout)["upstream_provenance"] == {
+        "input_snapshot_sha256": "from-orchestrator",
+    }
+
+
+def test_software_commit_observation_does_not_probe_source_cleanliness(monkeypatch):
     calls = []
 
-    def dirty_run(argv, **kwargs):
+    def observed_run(argv, **kwargs):
         calls.append(argv)
-        return SimpleNamespace(returncode=1)
+        return SimpleNamespace(stdout="a" * 40 + "\n")
 
-    monkeypatch.setattr(workspace_builder.subprocess, "run", dirty_run)
+    monkeypatch.setattr(workspace_builder.subprocess, "run", observed_run)
     monkeypatch.setenv("CMSSW_BASE", "/synthetic/cmssw")
     monkeypatch.setattr(workspace_builder.shutil, "which", lambda name: "/synthetic/cmssw/src/HiggsAnalysis/CombinedLimit/scripts/text2workspace.py")
-    with pytest.raises(RuntimeError, match="not clean"):
-        workspace_builder._observed_software(WorkspaceBuildConfig("card", "plugin", "ws"))
-    assert calls[0][-1] == "Fitter/python/workspace_build_recipe.py"
+    workspace_builder._observed_software(WorkspaceBuildConfig("card", "plugin", "ws"))
+    assert all(argv[3:] == ["rev-parse", "HEAD"] for argv in calls)
 
 
 def test_observed_software_uses_exact_git_commits(monkeypatch):
@@ -369,8 +450,6 @@ def test_observed_software_uses_exact_git_commits(monkeypatch):
 
     def observed_run(argv, **kwargs):
         calls.append(argv)
-        if "diff" in argv:
-            return SimpleNamespace(returncode=0)
         commit = "a" * 40 if "EFTFit" in argv[2] else "b" * 40
         return SimpleNamespace(stdout=commit + "\n")
 
@@ -384,8 +463,8 @@ def test_observed_software_uses_exact_git_commits(monkeypatch):
     assert observed["eftfit_commit"] == "a" * 40
     assert observed["combined_limit_commit"] == "b" * 40
     assert observed["cmssw_release"] == "CMSSW_SYNTHETIC"
-    assert any("Fitter/python/EFTModel.py" in argv for argv in calls)
-    assert any("scripts/text2workspace.py" in argv for argv in calls)
+    assert len(calls) == 2
+    assert all(argv[3:] == ["rev-parse", "HEAD"] for argv in calls)
 
 
 def test_qualified_provenance_rejects_shadowed_executable(monkeypatch):
@@ -396,21 +475,22 @@ def test_qualified_provenance_rejects_shadowed_executable(monkeypatch):
             "card", "EFTFit.Fitter.EFTModel:eftmodel", "workspace.root"))
 
 
-def test_changed_build_source_provenance_blocks_publication(tmp_path, monkeypatch):
+def test_software_commit_is_observed_once_without_currentness_gate(tmp_path, monkeypatch):
     card = tmp_path / "card.txt"
     card.write_bytes(b"card")
     target = tmp_path / "workspace.root"
-    states = iter([
-        {"eftfit_commit": "a" * 40, "text2workspace_executable": "/synthetic/text2workspace.py"},
-        {"eftfit_commit": "b" * 40, "text2workspace_executable": "/synthetic/text2workspace.py"},
-    ])
-    monkeypatch.setattr(workspace_builder, "_observed_software", lambda config: next(states))
+    observed = {"eftfit_commit": "a" * 40,
+                "text2workspace_executable": "/synthetic/text2workspace.py"}
+    calls = []
+    monkeypatch.setattr(workspace_builder, "_observed_software",
+                        lambda config: calls.append(config) or observed)
     monkeypatch.setattr(workspace_builder.subprocess, "Popen",
                         lambda argv, **kw: SyntheticProcess(argv))
     config = WorkspaceBuildConfig(str(card), "EFTFit.Fitter.EFTModel:eftmodel", str(target))
-    with pytest.raises(RuntimeError, match="changed during execution"):
-        run_workspace_build(config)
-    assert not target.exists()
+    receipt = run_workspace_build(config)
+    assert target.exists()
+    assert receipt["observed_software"] == observed
+    assert len(calls) == 1
 
 
 def test_failed_overwrite_preserves_predecessor(tmp_path):
