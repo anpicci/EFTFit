@@ -434,10 +434,14 @@ def test_configured_batch_rejects_legacy_range_control(tmp_path):
 )
 def test_legacy_batch_selects_maintained_range_table(wc_ranges, expected_range):
     fitter = RecordingBatchFitter()
-    fitter.batch1DScanEFT(scan_wcs=["legacy_one"], wc_ranges=wc_ranges)
+    fitter.batch1DScanEFT(scan_wcs=["legacy_one"], wc_ranges=wc_ranges, fit_config="legacy")
     arguments, keyword_arguments = fitter.grid_scan_calls[0]
     assert arguments[6][0] == "--setParameterRanges {}".format(expected_range)
-    assert keyword_arguments == {}
+    assert keyword_arguments == {
+        "track_error": False,
+        "fit_config": "legacy",
+        "execution_provenance": True,
+    }
 
 
 def test_legacy_batch_accepts_explicit_range_mapping():
@@ -445,6 +449,7 @@ def test_legacy_batch_accepts_explicit_range_mapping():
     fitter.batch1DScanEFT(
         scan_wcs=["legacy_one"],
         wc_ranges={"legacy_one": (-33.0, 33.0)},
+        fit_config="legacy",
     )
     arguments, _ = fitter.grid_scan_calls[0]
     assert arguments[6][0] == "--setParameterRanges legacy_one=-33.0,33.0"

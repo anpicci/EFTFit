@@ -241,6 +241,7 @@ def test_initial_submission_binds_workspace_bytes_and_records_attempt(
         other=["-t", "-1", "--setParameters", "c_one=0,c_two=0"],
         workspace=str(workspace),
         execution_provenance=True,
+        fit_config="legacy",
     )
 
     command = next(call for call in recorder.popen_calls if call[0] == "combineTool.py")

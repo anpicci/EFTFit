@@ -1,9 +1,13 @@
 """Pure package intake and maintained 1D dispatch, before model construction."""
 
 import ast
+import io
+import logging
+import os
 from pathlib import Path
 import shutil
 import sys
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -15,6 +19,7 @@ sys.path.insert(0, str(FITTER_DIR / "python"))
 import wc_fit_config  # noqa: E402
 from wc_fit_config import (  # noqa: E402
     WCFitConfig,
+    build_configured_grid_scan_command,
     load_fit_config,
     load_fit_input_package,
     resolve_scan_wcs,
@@ -64,6 +69,21 @@ def load_batch_method():
     return namespace["batch1DScanEFT"]
 
 
+def load_grid_scan_method(namespace):
+    script_path = FITTER_DIR / "scripts" / "EFTFitter.py"
+    tree = ast.parse(script_path.read_text(encoding="utf-8"))
+    fitter_class = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "EFTFit"
+    )
+    method = next(
+        node for node in fitter_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "gridScan"
+    )
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(script_path), "exec"), namespace)
+    return namespace["gridScan"]
+
+
 class RecordingFitter:
     batch1DScanEFT = load_batch_method()
 
@@ -74,6 +94,90 @@ class RecordingFitter:
 
     def gridScan(self, *args, **kwargs):
         self.grid_scan_calls.append((args, kwargs))
+
+
+@pytest.mark.parametrize("selection", [{}, {"fit_config": None}])
+def test_batch_requires_explicit_fit_input_selection(selection):
+    fitter = RecordingFitter()
+    with pytest.raises(ValueError, match="fit input/config selection must be explicit"):
+        fitter.batch1DScanEFT(**selection)
+    assert fitter.grid_scan_calls == []
+
+
+@pytest.mark.parametrize("selection", [{}, {"fit_config": None}])
+def test_grid_scan_requires_selection_before_workspace_lookup(selection):
+    def unexpected_workspace_lookup(_name):
+        pytest.fail("workspace lookup occurred before fit input selection")
+
+    grid_scan = load_grid_scan_method({
+        "logging": logging,
+        "os": SimpleNamespace(getenv=unexpected_workspace_lookup),
+    })
+    with pytest.raises(ValueError, match="fit input/config selection must be explicit"):
+        grid_scan(SimpleNamespace(), **selection)
+
+
+def test_grid_scan_explicit_legacy_uses_legacy_command(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace.root"
+    workspace.write_bytes(b"synthetic workspace placeholder")
+    monkeypatch.setenv("CMSSW_BASE", str(tmp_path))
+    popen_calls = []
+    call_calls = []
+
+    def record_popen(argv, **_kwargs):
+        popen_calls.append(list(argv))
+        return SimpleNamespace(stdout=io.BytesIO(), stderr=io.BytesIO(), wait=lambda: 0)
+
+    grid_scan = load_grid_scan_method({
+        "logging": logging,
+        "os": os,
+        "sp": SimpleNamespace(
+            PIPE=object(),
+            Popen=record_popen,
+            call=lambda argv: call_calls.append(list(argv)),
+        ),
+    })
+    fitter = SimpleNamespace(log_subprocess_output=lambda *_args: None)
+    grid_scan(
+        fitter,
+        fit_config="legacy",
+        workspace=str(workspace),
+        scan_params=["legacy_wc"],
+        points=7,
+    )
+    assert len(popen_calls) == 1
+    assert popen_calls[0][:7] == [
+        "combineTool.py", "-d", str(workspace), "-M", "MultiDimFit", "--algo", "grid"
+    ]
+    assert popen_calls[0][popen_calls[0].index("-P") + 1] == "legacy_wc"
+    assert popen_calls[0][popen_calls[0].index("--points") + 1] == "7"
+    assert call_calls[0][0] == "mv"
+
+
+@pytest.mark.parametrize("freeze", [False, True])
+def test_package_config_reaches_pure_configured_command(tmp_path, freeze):
+    package = load_fit_input_package(write_package(tmp_path / "package"))
+    assert isinstance(package.fit_config, WCFitConfig)
+    argv = build_configured_grid_scan_command(
+        fit_config_path=package.fit_config,
+        workspace="synthetic_workspace.root",
+        freeze=freeze,
+        scan_params=["c_alpha"],
+        params_tracked=["c_beta"],
+        points=7,
+    )
+
+    def option_values(option):
+        return [argv[index + 1] for index, value in enumerate(argv[:-1]) if value == option]
+
+    assert option_values("-P") == ["c_alpha"]
+    assert option_values("--redefineSignalPOIs") == ["c_alpha,c_beta"]
+    assert option_values("--trackParameters") == ["c_beta"]
+    assert option_values("--setParameters") == ["c_alpha=0,c_beta=0,c_fixed=0"]
+    assert option_values("--freezeParameters") == ["c_fixed"]
+    assert option_values("--setParameterRanges") == ["c_alpha=-1,2:c_beta=-3,4"]
+    assert option_values("--floatOtherPOIs") == ([] if freeze else ["1"])
+    assert "legacy_wc" not in " ".join(argv)
 
 
 def test_package_config_is_authority_and_dispatch_reuses_it(tmp_path):
