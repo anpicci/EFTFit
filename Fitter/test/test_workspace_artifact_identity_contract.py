@@ -380,3 +380,19 @@ def test_shell_workspace_wrapper_overwrite_and_model_arguments(
             "verbose",
         ]
         assert len(arguments) == output_index + 2
+
+
+def test_shell_workspace_wrapper_new_version_is_canonical(tmp_path):
+    target = tmp_path / "workspace.root"
+    target.write_bytes(b"old")
+    fake = tmp_path / "fake-text2workspace"
+    write_fake_workspace_executable(fake, "success")
+    environment = os.environ.copy()
+    environment["FAKE_ARGUMENT_LOG"] = str(tmp_path / "arguments.txt")
+    result = subprocess.run([
+        "bash", str(FITTER_DIR / "scripts/text2workspace.sh"),
+        "--output", str(target), "--executable", str(fake), "--new-version",
+    ], cwd=tmp_path, env=environment, check=False)
+    assert result.returncode == 0
+    assert target.read_bytes() == b"old"
+    assert (tmp_path / "workspace.v001.root").read_bytes() == b"replacement"

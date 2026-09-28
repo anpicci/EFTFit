@@ -13,5 +13,6 @@ build:
   allow_no_background: false
 output:
   workspace: ../../Fitter/test/synthetic_workspace.root
+  existing_policy: fail
 software:
-  eftfit: example_revision_for_provenance_only
+  eftfit_compatibility: example_declared_requirement_not_observed_provenance

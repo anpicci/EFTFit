@@ -11,7 +11,7 @@ from DatacardReader import DatacardReader
 from LvlFormatter import LvlFormatter
 from utils import regex_match,run_command,CombineMethod,FitAlgo,WorkspaceType,BatchType
 from options import HelperOptions
-from workspace_build_recipe import WorkspaceBuildConfig, build_workspace_argv
+from workspace_build_recipe import WorkspaceBuildConfig, build_workspace_argv, run_workspace_build
 
 class CombineHelper(object):
     '''
@@ -336,10 +336,8 @@ class CombineHelper(object):
             model_options=tuple(phys_ops),
             allow_no_background=len(self.dc_maker.getBackgroundProcesses()) == 0,
         )
-        args = build_workspace_argv(config)
-
-        self.logger.info("text2workspace command: %s",' '.join(args))
-        run_command(args)
+        self.logger.info("text2workspace command: %s", ' '.join(build_workspace_argv(config)))
+        return run_workspace_build(config)
 
     # Run combine using the FitDiagnostic method
     def make_fitdiagnostics(self):

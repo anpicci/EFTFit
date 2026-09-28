@@ -7,16 +7,18 @@ No Combine command is run by loading or building an argv.
 
 import argparse
 from dataclasses import dataclass
+import io
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 
 if __package__:
-    from .execution_provenance import workspace_identity
+    from .execution_provenance import file_identity, workspace_identity
 else:
-    from execution_provenance import workspace_identity
+    from execution_provenance import file_identity, workspace_identity
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,7 @@ class WorkspaceBuildConfig:
     allow_no_background: bool = False
     executable: str = "text2workspace.py"
     software: object = None
+    existing_policy: str = "fail"
 
 
 def _mapping(value, label, required, optional=()):
@@ -58,7 +61,10 @@ def normalize_workspace_build_recipe(data, base_dir):
         raise ValueError("unsupported workspace recipe schema_version")
     card = _mapping(data["input"], "input", ("combined_card",))
     model = _mapping(data["model"], "model", ("plugin",), ("options",))
-    output = _mapping(data["output"], "output", ("workspace",))
+    output = _mapping(data["output"], "output", ("workspace",), ("existing_policy",))
+    existing_policy = output.get("existing_policy", "fail")
+    if existing_policy not in ("fail", "overwrite", "new_version"):
+        raise ValueError("output.existing_policy must be fail, overwrite or new_version")
     build = _mapping(data.get("build", {}), "build", (), ("channel_masks", "allow_no_background"))
     parameterization = data.get("parameterization")
     if parameterization is not None:
@@ -91,6 +97,7 @@ def normalize_workspace_build_recipe(data, base_dir):
         channel_masks=build.get("channel_masks", False),
         allow_no_background=build.get("allow_no_background", False),
         software=dict(software),
+        existing_policy=existing_policy,
     )
 
 
@@ -118,17 +125,107 @@ def build_workspace_argv(config, output=None):
     return argv
 
 
-def run_workspace_build(config, overwrite=False, process_factory=None, output_handler=None):
-    """Guarded publication seam; caller must explicitly opt in to replacement."""
-    target = os.path.abspath(config.workspace)
+def _observed_software(config):
+    """Observe implementations for a qualified build, never a consumer gate."""
+    eftfit = Path(__file__).resolve().parents[2]
+    cmssw_base = os.environ.get("CMSSW_BASE")
+    if not cmssw_base:
+        raise RuntimeError("CMSSW_BASE is required for qualified build provenance")
+    combined_limit = Path(cmssw_base) / "src/HiggsAnalysis/CombinedLimit"
+    expected_executable = combined_limit / "scripts/text2workspace.py"
+    observed_executable = shutil.which(config.executable)
+    if not observed_executable or os.path.realpath(observed_executable) != os.path.realpath(expected_executable):
+        raise RuntimeError("text2workspace executable does not resolve to the observed CombinedLimit tree")
+
+    def require_clean(path, sources):
+        dirty = subprocess.run(
+            ["git", "-C", str(path), "diff", "--quiet", "HEAD", "--", *sources],
+            check=False,
+        )
+        if dirty.returncode != 0:
+            raise RuntimeError("Task-relevant workspace build source is not clean at its commit")
+
+    eftfit_sources = ["Fitter/python/workspace_build_recipe.py"]
+    if config.plugin.startswith("EFTFit.Fitter.EFTModel:"):
+        eftfit_sources.append("Fitter/python/EFTModel.py")
+    require_clean(eftfit, eftfit_sources)
+    combined_sources = ["scripts/text2workspace.py"]
+    if config.plugin.startswith("HiggsAnalysis.CombinedLimit.InterferenceModels:"):
+        combined_sources.append("python/InterferenceModels.py")
+    if config.plugin.startswith("HiggsAnalysis.CombinedLimit.PhysicsModel:"):
+        combined_sources.append("python/PhysicsModel.py")
+    require_clean(combined_limit, combined_sources)
+
+    def commit(path):
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        )
+        value = result.stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", value):
+            raise RuntimeError("Invalid observed software commit: {}".format(path))
+        return value
+
+    observed = {
+        "eftfit_commit": commit(eftfit),
+        "combined_limit_commit": commit(combined_limit),
+        "cmssw_release": os.environ.get("CMSSW_VERSION"),
+        "scram_arch": os.environ.get("SCRAM_ARCH"),
+        "text2workspace_executable": os.path.realpath(observed_executable),
+    }
+    if "CombineHarvester" in config.plugin:
+        observed["combine_harvester_commit"] = commit(Path(cmssw_base) / "src/CombineHarvester")
+    return observed
+
+
+def _versioned_sibling(target):
+    path = Path(target)
+    for number in range(1, 1000):
+        candidate = path.with_name("{}.v{:03d}{}".format(path.stem, number, path.suffix))
+        if not os.path.lexists(candidate):
+            return str(candidate)
+    raise RuntimeError("No available workspace version sibling")
+
+
+def run_workspace_build(config, overwrite=False, process_factory=None, output_handler=None,
+                        new_version=False):
+    """Build at a temporary locator, then publish according to explicit policy."""
+    if overwrite and new_version:
+        raise ValueError("overwrite and new_version are mutually exclusive")
+    if config.existing_policy not in ("fail", "overwrite", "new_version"):
+        raise ValueError("invalid existing_policy")
+    if (overwrite or new_version) and config.existing_policy != "fail":
+        raise ValueError("CLI policy conflicts with recipe existing_policy")
+    policy = "overwrite" if overwrite else "new_version" if new_version else config.existing_policy
+    requested = os.path.abspath(config.workspace)
+    target = requested
     target_directory = os.path.dirname(target)
     if not os.path.isdir(target_directory):
         raise RuntimeError("Workspace target directory does not exist: {}".format(target_directory))
-    if os.path.lexists(target):
+    predecessor = None
+    if os.path.lexists(requested):
         if os.path.islink(target) or not os.path.isfile(target):
             raise RuntimeError("Workspace target is not a regular file: {}".format(target))
-        if not overwrite:
-            raise RuntimeError("Workspace target already exists; pass overwrite to replace it: {}".format(target))
+        if policy == "fail":
+            raise RuntimeError("Workspace target already exists: {}".format(target))
+        predecessor = {"path": requested, **file_identity(requested)}
+        if policy == "new_version":
+            target = _versioned_sibling(requested)
+    known_plugin = config.plugin.startswith((
+        "EFTFit.Fitter.EFTModel:",
+        "HiggsAnalysis.CombinedLimit.InterferenceModels:",
+        "HiggsAnalysis.CombinedLimit.PhysicsModel:",
+    ))
+    qualified = (known_plugin and config.executable == "text2workspace.py" and
+                 process_factory in (None, subprocess.Popen))
+    observed_software = _observed_software(config) if qualified else None
+    input_identity = {
+        "combined_card_sha256": file_identity(config.combined_card)["sha256"] if os.path.isfile(config.combined_card) else None,
+        "parameterization_sha256": file_identity(config.parameterization_source)["sha256"] if config.parameterization_source and os.path.isfile(config.parameterization_source) else None,
+    }
+    if qualified and (not input_identity["combined_card_sha256"] or
+                      config.parameterization_option and not input_identity["parameterization_sha256"]):
+        raise RuntimeError("Qualified workspace build inputs must be readable files")
     descriptor, temporary = tempfile.mkstemp(
         prefix=".{}.".format(os.path.basename(target)), suffix=".tmp", dir=target_directory
     )
@@ -136,26 +233,47 @@ def run_workspace_build(config, overwrite=False, process_factory=None, output_ha
     os.unlink(temporary)
     try:
         argv = build_workspace_argv(config, temporary)
+        if qualified:
+            argv[0] = observed_software["text2workspace_executable"]
         factory = process_factory or subprocess.Popen
-        process = factory(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        with process.stdout, process.stderr:
-            if output_handler is not None:
-                output_handler(process.stdout, "info")
-                output_handler(process.stderr, "err")
-            else:
-                process.stdout.read()
-                process.stderr.read()
-        return_code = process.wait()
+        if output_handler is None:
+            process = factory(argv)
+            return_code = process.wait()
+        else:
+            process = factory(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+            output_handler(io.BytesIO(stdout or b""), "info")
+            output_handler(io.BytesIO(stderr or b""), "err")
+            return_code = process.returncode
         if return_code:
             raise RuntimeError("text2workspace command failed with code {}".format(return_code))
         if not os.path.isfile(temporary) or os.stat(temporary).st_size == 0:
             raise RuntimeError("text2workspace did not produce a nonempty workspace replacement")
-        if overwrite:
+        artifact = file_identity(temporary)
+        if qualified and _observed_software(config) != observed_software:
+            raise RuntimeError("Workspace build source provenance changed during execution")
+        if policy == "overwrite" and predecessor is not None:
+            if file_identity(requested) != {key: predecessor[key] for key in ("resolved_path", "size_bytes", "sha256")}:
+                raise RuntimeError("Workspace predecessor changed during build")
             os.replace(temporary, target)
         else:
             os.link(temporary, target)
             os.unlink(temporary)
-        return workspace_identity(config.workspace)
+        identity = workspace_identity(target)
+        return {
+            "schema_version": 1,
+            "requested_output_path": requested,
+            "resolved_output_path": target,
+            "existing_policy": policy,
+            "workspace": {"sha256": identity["sha256"], "size_bytes": artifact["size_bytes"]},
+            "sha256": identity["sha256"],
+            "predecessor": predecessor,
+            "replaced_artifact": predecessor if policy == "overwrite" else None,
+            "input": input_identity,
+            "recipe": {"schema_version": 1, "declared_software": config.software},
+            "observed_software": observed_software,
+            "qualified_provenance": qualified,
+        }
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -168,7 +286,9 @@ def main(argv=None):
     source.add_argument("--legacy-interference", action="store_true")
     parser.add_argument("--output")
     parser.add_argument("--executable", default="text2workspace.py")
-    parser.add_argument("--overwrite", action="store_true")
+    policy = parser.add_mutually_exclusive_group()
+    policy.add_argument("--overwrite", action="store_true")
+    policy.add_argument("--new-version", action="store_true")
     args = parser.parse_args(argv)
     if args.legacy_interference:
         config = WorkspaceBuildConfig(
@@ -182,7 +302,7 @@ def main(argv=None):
         if args.output or args.executable != "text2workspace.py":
             from dataclasses import replace
             config = replace(config, workspace=args.output or config.workspace, executable=args.executable)
-    run_workspace_build(config, overwrite=args.overwrite)
+    run_workspace_build(config, overwrite=args.overwrite, new_version=args.new_version)
 
 
 if __name__ == "__main__":

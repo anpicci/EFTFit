@@ -37,6 +37,16 @@ def _numeric_mapping(value, label):
     return dict(value)
 
 
+def _validate_start_values(starts, fit_config):
+    scientific = set(fit_config.scientific_wcs)
+    if set(starts) - scientific:
+        raise ValueError("fit_start_values must contain scientific WCs only")
+    for wc, value in starts.items():
+        lower, upper = fit_config.wc_ranges[wc]
+        if not lower <= value <= upper:
+            raise ValueError("fit_start_values.{} is outside configured range".format(wc))
+
+
 def normalize_inference_recipe(data, fit_config=None):
     """Validate family state; fit config remains the only WC/range authority."""
     if not isinstance(data, dict) or not {"schema_version", "family", "dataset_mode"} <= set(data):
@@ -68,8 +78,7 @@ def normalize_inference_recipe(data, fit_config=None):
         scientific = set(fit_config.scientific_wcs)
         if set(references) - scientific:
             raise ValueError("reference_values must contain scientific WCs only")
-        if set(starts) - scientific:
-            raise ValueError("fit_start_values must contain scientific WCs only")
+        _validate_start_values(starts, fit_config)
         if family in _IMPACT_FAMILIES:
             references = {wc: references.get(wc, 0) for wc in fit_config.scientific_wcs}
             for wc, value in references.items():
@@ -88,8 +97,6 @@ def _bind_reference_values(recipe, fit_config):
     scientific = set(fit_config.scientific_wcs)
     if set(recipe.reference_values) - scientific:
         raise ValueError("reference_values must contain scientific WCs only")
-    if set(recipe.fit_start_values) - scientific:
-        raise ValueError("fit_start_values must contain scientific WCs only")
     resolved = {wc: recipe.reference_values.get(wc, 0) for wc in fit_config.scientific_wcs}
     for wc, value in resolved.items():
         lower, upper = fit_config.wc_ranges[wc]
@@ -103,13 +110,18 @@ def bind_inference_invocation(recipe, fit_config, axes=(), report_targets=()):
     axes = tuple(axes)
     targets = tuple(report_targets)
     scientific = set(fit_config.scientific_wcs)
-    reference_values = _bind_reference_values(recipe, fit_config)
+    _validate_start_values(recipe.fit_start_values, fit_config)
     if recipe.family in _SCAN_FAMILIES:
         dimension, other_policy = _SCAN_FAMILIES[recipe.family]
         if len(axes) != dimension or len(set(axes)) != dimension or set(axes) - scientific:
             raise ValueError("scan axes must be distinct configured scientific WCs")
         if targets:
             raise ValueError("scan invocation does not use report_targets")
+        # Grid axes may initialize the initial fit, but never set grid points.
+        # Other scientific WCs are unavailable as starts in a frozen scan.
+        active = scientific if other_policy == "profiled" else set(axes)
+        if set(recipe.fit_start_values) - active:
+            raise ValueError("fit_start_values contains WCs fixed by this scan")
         return {
             "family": recipe.family,
             "dataset_mode": recipe.dataset_mode,
@@ -126,6 +138,10 @@ def bind_inference_invocation(recipe, fit_config, axes=(), report_targets=()):
         raise ValueError("report_targets must be configured scientific WCs")
     if recipe.family == "impacts_frozen" and len(targets) != 1:
         raise ValueError("impacts_frozen requires one target per production")
+    active = scientific if recipe.family == "impacts_profiled" else set(targets)
+    if set(recipe.fit_start_values) - active:
+        raise ValueError("fit_start_values contains WCs fixed by this impact")
+    reference_values = _bind_reference_values(recipe, fit_config)
     return {
         "family": recipe.family,
         "dataset_mode": recipe.dataset_mode,

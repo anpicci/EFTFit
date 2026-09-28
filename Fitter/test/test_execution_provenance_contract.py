@@ -17,11 +17,15 @@ SCRIPT_PATH = FITTER_DIR / "scripts" / "EFTFitter.py"
 class RecordedProcess:
     def __init__(self, return_code=0):
         self.return_code = return_code
+        self.returncode = return_code
         self.stdout = io.BytesIO()
         self.stderr = io.BytesIO()
 
     def wait(self):
         return self.return_code
+
+    def communicate(self):
+        return self.stdout.getvalue(), self.stderr.getvalue()
 
 
 class RecordingSubprocess:
