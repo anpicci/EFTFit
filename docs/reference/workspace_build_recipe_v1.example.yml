@@ -1,0 +1,17 @@
+# Synthetic example. Relative locators resolve from this recipe's directory.
+schema_version: 1
+input:
+  combined_card: ../../Fitter/test/synthetic_combined_card.txt
+model:
+  plugin: EFTFit.Fitter.EFTModel:eftmodel
+  options: []
+parameterization:
+  option: fits
+  source: ../../Fitter/hist_files/synthetic_parameterization.npy
+build:
+  channel_masks: true
+  allow_no_background: false
+output:
+  workspace: ../../Fitter/test/synthetic_workspace.root
+software:
+  eftfit: example_revision_for_provenance_only

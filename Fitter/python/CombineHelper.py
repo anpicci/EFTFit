@@ -11,6 +11,7 @@ from DatacardReader import DatacardReader
 from LvlFormatter import LvlFormatter
 from utils import regex_match,run_command,CombineMethod,FitAlgo,WorkspaceType,BatchType
 from options import HelperOptions
+from workspace_build_recipe import WorkspaceBuildConfig, build_workspace_argv
 
 class CombineHelper(object):
     '''
@@ -327,12 +328,15 @@ class CombineHelper(object):
             self.logger.error("Unknown workspace type: %s",ws_type)
             raise RuntimeError
 
-        args = ['text2workspace.py',datacard]
-        args.extend(['-o',ws_file])
-        args.extend(['-P',model])
-        if len(self.dc_maker.getBackgroundProcesses()) == 0:
-            args.extend(['--X-allow-no-background'])
-        for po in phys_ops: args.extend(['--PO',po])
+        # Card-maker side effects remain here; one module owns argv layout.
+        config = WorkspaceBuildConfig(
+            combined_card=datacard,
+            plugin=model,
+            workspace=ws_file,
+            model_options=tuple(phys_ops),
+            allow_no_background=len(self.dc_maker.getBackgroundProcesses()) == 0,
+        )
+        args = build_workspace_argv(config)
 
         self.logger.info("text2workspace command: %s",' '.join(args))
         run_command(args)

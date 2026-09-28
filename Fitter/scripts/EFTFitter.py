@@ -5,7 +5,6 @@ import logging
 import subprocess as sp
 import shutil
 import shlex
-import tempfile
 import ROOT
 import itertools
 import glob
@@ -31,11 +30,11 @@ from EFTFit.Fitter.execution_provenance import (
     sha256_file,
     validate_final_provenance,
     workspace_identity,
-    workspace_identity_schema,
     workspace_job_identity_basis,
     write_json_exclusive,
 )
 from EFTFit.Fitter.wc_fit_config import build_configured_grid_scan_command, load_fit_config, load_fit_input_package, resolve_scan_wcs
+from EFTFit.Fitter.workspace_build_recipe import WorkspaceBuildConfig, run_workspace_build
 from itertools import chain
 from scipy.stats import chi2
 
@@ -909,68 +908,19 @@ class EFTFit(object):
         CMSSW_BASE = os.getenv('CMSSW_BASE')
         if CMSSW_BASE is None:
             raise RuntimeError('CMSSW_BASE is required to resolve EFT parameterization')
-        target = os.path.abspath(output)
-        if os.path.lexists(target):
-            if not os.path.isfile(target):
-                raise RuntimeError('Workspace target is not a regular file: {}'.format(target))
-            if not overwrite:
-                raise RuntimeError(
-                    'Workspace target already exists; pass overwrite=True to replace it: '
-                    '{}'.format(target)
-                )
-            old_identity = workspace_identity(output)
-            logging.info('Replacing workspace identity %s', old_identity)
-        target_directory = os.path.dirname(target)
-        if not os.path.isdir(target_directory):
-            raise RuntimeError(
-                'Workspace target directory does not exist: {}'.format(target_directory)
-            )
-        descriptor, temporary_output = tempfile.mkstemp(
-            prefix='.{}.'.format(os.path.basename(target)),
-            suffix='.tmp',
-            dir=target_directory,
+        config = WorkspaceBuildConfig(
+            combined_card=datacard,
+            plugin='EFTFit.Fitter.EFTModel:eftmodel',
+            workspace=output,
+            parameterization_option='fits',
+            parameterization_source=CMSSW_BASE+'/src/EFTFit/Fitter/hist_files/EFT_Parameterization.npy',
+            channel_masks=True,
+            executable=text2workspace_executable,
         )
-        os.close(descriptor)
-        os.unlink(temporary_output)
-        args = [
-            text2workspace_executable,
-            datacard,
-            '-P',
-            'EFTFit.Fitter.EFTModel:eftmodel',
-            '--PO',
-            'fits='+CMSSW_BASE+'/src/EFTFit/Fitter/hist_files/EFT_Parameterization.npy',
-            '-o',
-            temporary_output,
-            '--channel-masks',
-        ]
-
-        try:
-            logging.info(' '.join(args))
-            process = sp.Popen(args, stdout=sp.PIPE, stderr=sp.PIPE)
-            with process.stdout,process.stderr:
-                self.log_subprocess_output(process.stdout,'info')
-                self.log_subprocess_output(process.stderr,'err')
-            return_code = process.wait()
-            if return_code != 0:
-                raise RuntimeError(
-                    'text2workspace command failed with code {}'.format(return_code)
-                )
-            if not os.path.isfile(temporary_output) or os.stat(temporary_output).st_size == 0:
-                raise RuntimeError(
-                    'text2workspace did not produce a nonempty workspace replacement'
-                )
-            replacement_identity = file_identity(temporary_output)
-            os.replace(temporary_output, target)
-            return {
-                'schema': workspace_identity_schema,
-                'requested_path': os.fspath(output),
-                'resolved_path': os.path.realpath(target),
-                'size_bytes': replacement_identity['size_bytes'],
-                'sha256': replacement_identity['sha256'],
-            }
-        finally:
-            if os.path.exists(temporary_output):
-                os.unlink(temporary_output)
+        return run_workspace_build(
+            config, overwrite=overwrite, process_factory=sp.Popen,
+            output_handler=self.log_subprocess_output,
+        )
         
     def bestFit(self, name='.test', params_POI=[], startValuesString='', freeze=False, autoBounds=True, other=[]):
         ### Multidimensional fit ###

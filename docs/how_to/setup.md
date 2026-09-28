@@ -80,4 +80,18 @@ published only when the result is nonempty; failed or empty generation
 preserves an existing workspace. A rebuild is not required when an already
 qualified frozen workspace is supplied.
 
+For an explicit build, use a YAML recipe with the maintained builder:
+
+```bash
+python "$CMSSW_BASE/src/EFTFit/Fitter/python/workspace_build_recipe.py" --recipe path/to/workspace_build.yml
+```
+
+See `docs/reference/workspace_build_recipe_v1.example.yml` for the field
+shape. Relative card, parameterization, and output locators resolve from the
+recipe directory. The recipe names the plugin and build options; it does not
+define WC membership or ranges. `docs/reference/inference_recipe_v1.examples.yml`
+shows the six supported inference families. Scan axes and impact report targets
+are supplied when binding a concrete invocation, and the fit configuration
+remains their WC authority. These examples contain no production inputs.
+
 Continue with [the configured 1D workflow](run_configured_1d.md).

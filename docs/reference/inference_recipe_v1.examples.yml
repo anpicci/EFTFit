@@ -1,0 +1,33 @@
+# Each YAML document is one family recipe. Axes and report targets are invocation inputs.
+---
+schema_version: 1
+family: scan_1d_profiled
+dataset_mode: observed
+---
+schema_version: 1
+family: scan_1d_frozen
+dataset_mode: observed
+---
+schema_version: 1
+family: scan_2d_profiled
+dataset_mode: observed
+---
+schema_version: 1
+family: scan_2d_frozen
+dataset_mode: observed
+---
+schema_version: 1
+family: impacts_frozen
+dataset_mode: asimov
+impacts:
+  nuisance_selector: modelconfig_free_non_wc
+  reference_values: {}
+fit_start_values: {}
+---
+schema_version: 1
+family: impacts_profiled
+dataset_mode: asimov
+impacts:
+  nuisance_selector: modelconfig_free_non_wc
+  reference_values: {ctW: 1.0} # illustrative benchmark; validate against bound fit config
+fit_start_values: {ctW: 0.0}
