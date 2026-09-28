@@ -35,7 +35,7 @@ from EFTFit.Fitter.execution_provenance import (
     workspace_job_identity_basis,
     write_json_exclusive,
 )
-from EFTFit.Fitter.wc_fit_config import build_configured_grid_scan_command, load_fit_config, resolve_scan_wcs
+from EFTFit.Fitter.wc_fit_config import build_configured_grid_scan_command, load_fit_config, load_fit_input_package, resolve_scan_wcs
 from itertools import chain
 from scipy.stats import chi2
 
@@ -1096,9 +1096,14 @@ class EFTFit(object):
         # Remove the temporary directory and split root files
         sp.call(['rm','-r',taskname+'tmp'])
 
-    def gridScan(self, name='.test', batch='', freeze=False, scan_params=['ctW','ctZ'], params_tracked=[], points=90000, other=[], mask=[], mask_syst=[], workspace='EFTWorkspace.root', track_error=False, fit_config=None, execution_provenance=False):
+    def gridScan(self, name='.test', batch='', freeze=False, scan_params=['ctW','ctZ'], params_tracked=[], points=90000, other=[], mask=[], mask_syst=[], workspace='EFTWorkspace.root', track_error=False, fit_config=None, execution_provenance=False, fit_package_root=None):
         ### Runs deltaNLL Scan in two parameters using CRAB or Condor ###
         logging.info("Doing grid scan...")
+
+        if fit_config == 'package':
+            fit_config = load_fit_input_package(fit_package_root).fit_config
+        elif fit_package_root is not None:
+            raise ValueError('fit_package_root requires package mode')
 
         CMSSW_BASE = os.getenv('CMSSW_BASE')
         if not "/afs/" in workspace:
@@ -1109,7 +1114,7 @@ class EFTFit(object):
         if not os.path.exists(wsname):
             raise RuntimeError('Failed to find the workspace, either considering it as a local afs path or an absolute path. Please, fix it!')
         print('Workspace found! I am gonna use it for running fits...')
-        if fit_config is not None:
+        if fit_config not in (None, 'legacy'):
             configured_other = list(other)
             if mask_syst:
                 configured_other.extend(['--freezeParameters', ','.join(mask_syst)])
@@ -1856,10 +1861,14 @@ class EFTFit(object):
 
         return (graphwcs, graphnlls)
 
-    def batch1DScanEFT(self, basename='.test', batch='crab', freeze=False, scan_wcs=[], points=300, other=[], mask=[], mask_syst=[], workspace='EFTWorkspace.root', ignore=[], wc_ranges=None, wc_val=None, fit_config=None):
+    def batch1DScanEFT(self, basename='.test', batch='crab', freeze=False, scan_wcs=[], points=300, other=[], mask=[], mask_syst=[], workspace='EFTWorkspace.root', ignore=[], wc_ranges=None, wc_val=None, fit_config=None, fit_package_root=None):
         ### For each wc, run a 1D deltaNLL Scan.
-        if fit_config is not None:
-            config = load_fit_config(fit_config)
+        if fit_config == 'package':
+            fit_config = load_fit_input_package(fit_package_root).fit_config
+        elif fit_package_root is not None:
+            raise ValueError('fit_package_root requires package mode')
+        if fit_config not in (None, 'legacy'):
+            config = fit_config if hasattr(fit_config, 'scientific_wcs') else load_fit_config(fit_config)
             scan_wcs = list(resolve_scan_wcs(config, scan_wcs))
             if ignore:
                 raise ValueError('ignore cannot override configured WC populations')

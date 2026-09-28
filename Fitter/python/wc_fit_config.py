@@ -25,6 +25,38 @@ class WCFitConfig:
     wc_ranges: dict
 
 
+@dataclass(frozen=True)
+class FitInputPackage:
+    root: Path
+    datacards: Path
+    config_path: Path
+    fit_config: WCFitConfig
+
+
+def load_fit_input_package(fit_package_root):
+    """Resolve the portable runtime inputs and load their scientific config once."""
+    if fit_package_root is None or not str(fit_package_root).strip():
+        raise ValueError("fit package root is required in package mode")
+    root = Path(fit_package_root)
+    if not root.is_dir():
+        raise ValueError("fit package root is not a directory: {}".format(root))
+    root = root.resolve()
+    datacards = root / "datacards"
+    config_path = root / "config" / "TOP_26_006.yml"
+    if not datacards.is_dir():
+        raise ValueError("fit package datacards/ directory is missing: {}".format(datacards))
+    if not config_path.is_file():
+        raise ValueError("fit package config/TOP_26_006.yml is missing: {}".format(config_path))
+    for path in (datacards, config_path):
+        if not path.resolve().is_relative_to(root):
+            raise ValueError("fit package input resolves outside package root: {}".format(path))
+    try:
+        config = load_fit_config(config_path)
+    except (OSError, UnicodeError, yaml.YAMLError, ValueError) as error:
+        raise ValueError("fit package config is invalid: {}".format(error)) from error
+    return FitInputPackage(root, datacards, config_path, config)
+
+
 def validate_wc_population(scientific_wcs, fixed_wcs):
     """Validate and return the two ordered, disjoint WC populations."""
     scientific = tuple(scientific_wcs)
@@ -386,7 +418,11 @@ def build_configured_grid_scan_command(
     track_error=False,
 ):
     """Build a configured CombineTool grid-scan argv without executing it."""
-    config = load_fit_config(fit_config_path)
+    config = (
+        fit_config_path
+        if isinstance(fit_config_path, WCFitConfig)
+        else load_fit_config(fit_config_path)
+    )
     scan_wcs = resolve_scan_wcs(config, scan_params)
     tracked = tuple(params_tracked or ())
 
