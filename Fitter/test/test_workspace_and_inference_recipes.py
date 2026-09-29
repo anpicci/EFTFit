@@ -68,7 +68,8 @@ def test_canonical_cli_loads_yaml_without_executing_combine(monkeypatch):
     observed = []
     def fake_build(config, overwrite, new_version, output_handler):
         observed.append((config, overwrite, new_version))
-        return {"synthetic": True}
+        return {"resolved_output_path": config.workspace,
+                "receipt_path": workspace_builder._receipt_path(config.workspace)}
 
     monkeypatch.setattr(workspace_builder, "run_workspace_build", fake_build)
     workspace_builder.main(["--recipe", str(path)])
@@ -308,6 +309,9 @@ def test_collision_policies(tmp_path, initial, policy, expected_name, expected_b
     else:
         receipt = run_workspace_build(config, process_factory=factory)
         assert Path(receipt["resolved_output_path"]).name == expected_name
+        assert Path(receipt["receipt_path"]).name == expected_name.replace(
+            ".root", ".build_receipt.yml")
+        assert yaml.safe_load(Path(receipt["receipt_path"]).read_text()) == receipt
         assert receipt["workspace"]["sha256"] == hashlib.sha256(b"new").hexdigest()
         if initial:
             assert receipt["predecessor"]["path"] == str(target)
@@ -321,9 +325,12 @@ def test_new_version_chooses_first_free_sibling(tmp_path):
     target = tmp_path / "workspace.root"
     target.write_bytes(b"base")
     (tmp_path / "workspace.v001.root").write_bytes(b"first")
+    (tmp_path / "workspace.v002.build_receipt.yml").write_text("occupied")
     config = WorkspaceBuildConfig("card", "plugin", str(target), existing_policy="new_version")
     receipt = run_workspace_build(config, process_factory=lambda argv, **kw: SyntheticProcess(argv))
-    assert Path(receipt["resolved_output_path"]).name == "workspace.v002.root"
+    assert Path(receipt["resolved_output_path"]).name == "workspace.v003.root"
+    assert Path(receipt["receipt_path"]).name == "workspace.v003.build_receipt.yml"
+    assert (tmp_path / "workspace.v002.build_receipt.yml").read_text() == "occupied"
     assert target.read_bytes() == b"base"
     assert (tmp_path / "workspace.v001.root").read_bytes() == b"first"
 
@@ -334,6 +341,64 @@ def test_new_version_without_existing_base_uses_requested_path(tmp_path):
     receipt = run_workspace_build(config, process_factory=lambda argv, **kw: SyntheticProcess(argv))
     assert receipt["resolved_output_path"] == str(target)
     assert receipt["predecessor"] is None
+
+
+def test_receipt_collision_protects_base_and_versions_before_subprocess(tmp_path):
+    target = tmp_path / "workspace.root"
+    matching = tmp_path / "workspace.build_receipt.yml"
+    matching.write_text("occupied")
+    calls = []
+
+    def factory(argv, **kwargs):
+        calls.append(argv)
+        return SyntheticProcess(argv)
+
+    with pytest.raises(RuntimeError, match="receipt already exists"):
+        run_workspace_build(WorkspaceBuildConfig("card", "plugin", str(target)),
+                            process_factory=factory)
+    assert calls == []
+    receipt = run_workspace_build(
+        WorkspaceBuildConfig("card", "plugin", str(target), existing_policy="new_version"),
+        process_factory=factory,
+    )
+    assert Path(receipt["resolved_output_path"]).name == "workspace.v001.root"
+    assert receipt["receipt_path"] != receipt["resolved_output_path"]
+    assert matching.read_text() == "occupied"
+
+
+def test_unusable_receipt_destination_fails_before_subprocess(tmp_path):
+    target = tmp_path / "workspace.root"
+    (tmp_path / "workspace.build_receipt.yml").mkdir()
+    calls = []
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        run_workspace_build(
+            WorkspaceBuildConfig("card", "plugin", str(target), existing_policy="overwrite"),
+            process_factory=lambda argv, **kw: calls.append(argv),
+        )
+    assert calls == []
+    assert not target.exists()
+
+
+def test_receipt_parent_write_failure_precedes_subprocess(tmp_path, monkeypatch):
+    target = tmp_path / "workspace.root"
+    calls = []
+    original_mkstemp = workspace_builder.tempfile.mkstemp
+
+    def fail_receipt_temp(*args, **kwargs):
+        if args and args[0].startswith(".workspace.build_receipt.yml"):
+            raise PermissionError("synthetic receipt destination failure")
+        if kwargs.get("prefix", "").startswith(".workspace.build_receipt.yml"):
+            raise PermissionError("synthetic receipt destination failure")
+        return original_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(workspace_builder.tempfile, "mkstemp", fail_receipt_temp)
+    with pytest.raises(PermissionError, match="receipt destination failure"):
+        run_workspace_build(
+            WorkspaceBuildConfig("card", "plugin", str(target)),
+            process_factory=lambda argv, **kw: calls.append(argv),
+        )
+    assert calls == []
+    assert not target.exists()
 
 
 def test_qualified_receipt_records_observed_commits_without_currentness_gate(tmp_path, monkeypatch):
@@ -354,11 +419,11 @@ def test_qualified_receipt_records_observed_commits_without_currentness_gate(tmp
     assert "current_head" not in receipt
 
 
-def test_cli_emits_and_atomically_writes_matching_receipt(tmp_path, monkeypatch, capfd):
+def test_cli_writes_mandatory_yaml_receipt_and_prints_locator(tmp_path, monkeypatch, capfd):
     card = tmp_path / "card.txt"
     card.write_bytes(b"card")
     target = tmp_path / "workspace.root"
-    receipt_path = tmp_path / "build.json"
+    receipt_path = tmp_path / "workspace.build_receipt.yml"
     recipe_path = tmp_path / "recipe.yml"
     recipe_path.write_text(yaml.safe_dump({
         "schema_version": 1,
@@ -370,22 +435,12 @@ def test_cli_emits_and_atomically_writes_matching_receipt(tmp_path, monkeypatch,
     }), encoding="utf-8")
     monkeypatch.setattr(workspace_builder.subprocess, "Popen",
                         lambda argv, **kw: SyntheticProcess(argv))
-    replaces = []
-    real_replace = os.replace
-
-    def observed_replace(source, destination):
-        assert Path(source).is_file()
-        replaces.append((source, destination))
-        real_replace(source, destination)
-
-    monkeypatch.setattr(workspace_builder.os, "replace", observed_replace)
-    workspace_builder.main(["--recipe", str(recipe_path), "--receipt", str(receipt_path)])
+    workspace_builder.main(["--recipe", str(recipe_path)])
     stdout, stderr = capfd.readouterr()
-    receipt = json.loads(stdout)
-    assert json.loads(receipt_path.read_text(encoding="utf-8")) == receipt
-    assert stdout == receipt_path.read_text(encoding="utf-8")
-    assert len(replaces) == 1 and replaces[0][1] == receipt_path
-    assert not Path(replaces[0][0]).exists()
+    receipt = yaml.safe_load(receipt_path.read_text(encoding="utf-8"))
+    assert stdout == "Workspace: {}\nReceipt: {}\n".format(target, receipt_path)
+    assert receipt["schema_version"] == 1
+    assert receipt["receipt_path"] == str(receipt_path)
     assert "stdout" in stderr and "stderr" in stderr
     assert receipt["requested_output_path"] == str(target)
     assert receipt["resolved_output_path"] == str(target)
@@ -426,7 +481,9 @@ def test_cli_upstream_identity_override_is_opaque(tmp_path, monkeypatch, capfd):
     workspace_builder.main(["--recipe", str(recipe_path),
                             "--input-snapshot-sha256", "from-orchestrator"])
     stdout, _ = capfd.readouterr()
-    assert json.loads(stdout)["upstream_provenance"] == {
+    assert "Receipt: {}".format(tmp_path / "workspace.build_receipt.yml") in stdout
+    assert yaml.safe_load((tmp_path / "workspace.build_receipt.yml").read_text())[
+        "upstream_provenance"] == {
         "input_snapshot_sha256": "from-orchestrator",
     }
 
@@ -496,11 +553,63 @@ def test_software_commit_is_observed_once_without_currentness_gate(tmp_path, mon
 def test_failed_overwrite_preserves_predecessor(tmp_path):
     target = tmp_path / "workspace.root"
     target.write_bytes(b"old")
+    receipt_path = tmp_path / "workspace.build_receipt.yml"
+    receipt_path.write_text("old receipt")
     config = WorkspaceBuildConfig("card", "plugin", str(target), existing_policy="overwrite")
     with pytest.raises(RuntimeError, match="code 7"):
         run_workspace_build(config, process_factory=lambda argv, **kw: SyntheticProcess(argv, returncode=7))
     assert target.read_bytes() == b"old"
+    assert receipt_path.read_text() == "old receipt"
     assert not list(tmp_path.glob(".workspace.root.*.tmp"))
+    assert not list(tmp_path.glob(".workspace.build_receipt.yml.*.tmp"))
+
+
+def test_failed_new_build_publishes_neither_artifact(tmp_path):
+    target = tmp_path / "workspace.root"
+    with pytest.raises(RuntimeError, match="code 7"):
+        run_workspace_build(
+            WorkspaceBuildConfig("card", "plugin", str(target)),
+            process_factory=lambda argv, **kw: SyntheticProcess(argv, returncode=7),
+        )
+    assert not target.exists()
+    assert not (tmp_path / "workspace.build_receipt.yml").exists()
+
+
+def test_overwrite_observes_predecessor_once(tmp_path, monkeypatch):
+    target = tmp_path / "workspace.root"
+    target.write_bytes(b"old")
+    observed = []
+    original_identity = workspace_builder.file_identity
+
+    def observe(path):
+        observed.append(str(path))
+        return original_identity(path)
+
+    monkeypatch.setattr(workspace_builder, "file_identity", observe)
+    receipt = run_workspace_build(
+        WorkspaceBuildConfig("card", "plugin", str(target), existing_policy="overwrite"),
+        process_factory=lambda argv, **kw: SyntheticProcess(argv),
+    )
+    assert observed.count(str(target)) == 1
+    assert receipt["predecessor"]["sha256"] == hashlib.sha256(b"old").hexdigest()
+    assert target.read_bytes() == b"new"
+
+
+def test_yaml_serialization_failure_publishes_no_pair(tmp_path, monkeypatch):
+    target = tmp_path / "workspace.root"
+    receipt_path = tmp_path / "workspace.build_receipt.yml"
+
+    def fail_serialization(*args, **kwargs):
+        raise ValueError("synthetic serialization failure")
+
+    monkeypatch.setattr(workspace_builder.yaml, "safe_dump", fail_serialization)
+    with pytest.raises(ValueError, match="synthetic serialization failure"):
+        run_workspace_build(
+            WorkspaceBuildConfig("card", "plugin", str(target)),
+            process_factory=lambda argv, **kw: SyntheticProcess(argv),
+        )
+    assert not target.exists()
+    assert not receipt_path.exists()
 
 
 def test_collision_flags_are_mutually_exclusive(tmp_path):

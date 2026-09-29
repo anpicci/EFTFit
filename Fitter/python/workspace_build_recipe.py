@@ -8,7 +8,6 @@ No Combine command is run by loading or building an argv.
 import argparse
 from dataclasses import dataclass
 import io
-import json
 import os
 from pathlib import Path
 import re
@@ -16,11 +15,12 @@ import shutil
 import subprocess
 import tempfile
 import sys
+import yaml
 
 if __package__:
-    from .execution_provenance import file_identity, workspace_identity
+    from .execution_provenance import file_identity
 else:
-    from execution_provenance import file_identity, workspace_identity
+    from execution_provenance import file_identity
 
 
 @dataclass(frozen=True)
@@ -165,11 +165,16 @@ def _observed_software(config):
     return observed
 
 
+def _receipt_path(target):
+    path = Path(target)
+    return str(path.with_name("{}.build_receipt.yml".format(path.stem)))
+
+
 def _versioned_sibling(target):
     path = Path(target)
     for number in range(1, 1000):
         candidate = path.with_name("{}.v{:03d}{}".format(path.stem, number, path.suffix))
-        if not os.path.lexists(candidate):
+        if not os.path.lexists(candidate) and not os.path.lexists(_receipt_path(candidate)):
             return str(candidate)
     raise RuntimeError("No available workspace version sibling")
 
@@ -196,8 +201,17 @@ def run_workspace_build(config, overwrite=False, process_factory=None, output_ha
         if policy == "fail":
             raise RuntimeError("Workspace target already exists: {}".format(target))
         predecessor = {"path": requested, **file_identity(requested)}
-        if policy == "new_version":
-            target = _versioned_sibling(requested)
+    if policy == "new_version" and (os.path.lexists(requested) or
+                                    os.path.lexists(_receipt_path(requested))):
+        target = _versioned_sibling(requested)
+    receipt_path = _receipt_path(target)
+    if receipt_path == target:
+        raise RuntimeError("Workspace and receipt destinations must differ")
+    if os.path.lexists(receipt_path):
+        if policy != "overwrite":
+            raise RuntimeError("Workspace receipt already exists: {}".format(receipt_path))
+        if os.path.islink(receipt_path) or not os.path.isfile(receipt_path):
+            raise RuntimeError("Workspace receipt is not a regular file: {}".format(receipt_path))
     known_plugin = config.plugin.startswith((
         "EFTFit.Fitter.EFTModel:",
         "HiggsAnalysis.CombinedLimit.InterferenceModels:",
@@ -219,7 +233,13 @@ def run_workspace_build(config, overwrite=False, process_factory=None, output_ha
     )
     os.close(descriptor)
     os.unlink(temporary)
+    receipt_temporary = None
     try:
+        descriptor, receipt_temporary = tempfile.mkstemp(
+            prefix=".{}.".format(os.path.basename(receipt_path)),
+            suffix=".tmp", dir=target_directory,
+        )
+        os.close(descriptor)
         argv = build_workspace_argv(config, temporary)
         if qualified:
             argv[0] = observed_software["text2workspace_executable"]
@@ -237,18 +257,12 @@ def run_workspace_build(config, overwrite=False, process_factory=None, output_ha
             raise RuntimeError("text2workspace command failed with code {}".format(return_code))
         if not os.path.isfile(temporary) or os.stat(temporary).st_size == 0:
             raise RuntimeError("text2workspace did not produce a nonempty workspace replacement")
-        if policy == "overwrite" and predecessor is not None:
-            if file_identity(requested) != {key: predecessor[key] for key in ("resolved_path", "size_bytes", "sha256")}:
-                raise RuntimeError("Workspace predecessor changed during build")
-            os.replace(temporary, target)
-        else:
-            os.link(temporary, target)
-            os.unlink(temporary)
-        identity = workspace_identity(target)
-        return {
+        identity = file_identity(temporary)
+        receipt = {
             "schema_version": 1,
             "requested_output_path": requested,
             "resolved_output_path": target,
+            "receipt_path": receipt_path,
             "existing_policy": policy,
             "workspace": {"sha256": identity["sha256"], "size_bytes": identity["size_bytes"]},
             "sha256": identity["sha256"],
@@ -272,9 +286,24 @@ def run_workspace_build(config, overwrite=False, process_factory=None, output_ha
             "observed_software": observed_software,
             "qualified_provenance": qualified,
         }
+        with open(receipt_temporary, "w", encoding="utf-8") as stream:
+            yaml.safe_dump(receipt, stream, sort_keys=False, allow_unicode=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if policy == "overwrite":
+            os.replace(temporary, target)
+            os.replace(receipt_temporary, receipt_path)
+        else:
+            os.link(temporary, target)
+            os.unlink(temporary)
+            os.link(receipt_temporary, receipt_path)
+            os.unlink(receipt_temporary)
+        return receipt
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+        if receipt_temporary and os.path.exists(receipt_temporary):
+            os.unlink(receipt_temporary)
 
 
 def main(argv=None):
@@ -284,7 +313,6 @@ def main(argv=None):
     source.add_argument("--legacy-interference", action="store_true")
     parser.add_argument("--output")
     parser.add_argument("--executable", default="text2workspace.py")
-    parser.add_argument("--receipt", help="atomically write the JSON build receipt")
     parser.add_argument("--input-snapshot-sha256", help="carry an upstream package identity unchanged")
     policy = parser.add_mutually_exclusive_group()
     policy.add_argument("--overwrite", action="store_true")
@@ -305,32 +333,14 @@ def main(argv=None):
     if args.input_snapshot_sha256 is not None:
         from dataclasses import replace
         config = replace(config, input_snapshot_sha256=args.input_snapshot_sha256)
-    if args.receipt and Path(args.receipt).absolute() == Path(config.workspace).absolute():
-        raise ValueError("receipt path must differ from the workspace path")
-
     def forward_output(stream, level):
         sys.stderr.buffer.write(stream.read())
         sys.stderr.flush()
 
     receipt = run_workspace_build(config, overwrite=args.overwrite,
                                   new_version=args.new_version, output_handler=forward_output)
-    encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
-    if args.receipt:
-        receipt_path = Path(args.receipt).absolute()
-        if receipt_path == Path(receipt["resolved_output_path"]):
-            raise ValueError("receipt path must differ from the workspace path")
-        descriptor, temporary = tempfile.mkstemp(prefix=".{}.".format(receipt_path.name),
-                                                suffix=".tmp", dir=receipt_path.parent)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                stream.write(encoded)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, receipt_path)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
-    sys.stdout.write(encoded)
+    sys.stdout.write("Workspace: {}\nReceipt: {}\n".format(
+        receipt["resolved_output_path"], receipt["receipt_path"]))
 
 
 if __name__ == "__main__":

@@ -73,8 +73,10 @@ analysis authority.
 ## EFT workspace build receipt
 
 `Fitter/python/workspace_build_recipe.py --recipe <path>` constructs the EFT
-workspace command and prints one JSON receipt. `--receipt <path>` atomically
-writes the same receipt for a later workflow step. The receipt records the
+workspace command and always writes a YAML receipt beside the resolved workspace.
+For `workspace.root` the receipt is `workspace.build_receipt.yml`; for
+`workspace.v001.root` it is `workspace.v001.build_receipt.yml`. Standard output
+prints the two artifact locators. The receipt records the
 normalized model options, requested and resolved output paths, collision
 policy, final workspace SHA-256 and size, predecessor identity when replaced,
 and observed software commits for qualified builds. Optional
@@ -82,6 +84,9 @@ and observed software commits for qualified builds. Optional
 `--input-snapshot-sha256 <value>` carries an upstream package identity into
 the receipt without recomputing it. The workspace SHA-256 remains the artifact
 identity; paths and software commits are provenance.
+`fail` rejects a collision at either artifact path; `new_version` chooses the
+first suffix with both paths free. `overwrite` requires explicit selection and
+builds both temporary artifacts before replacing the published pair.
 
 This is the canonical command-construction owner for EFT/TOP-26-006 workspace
 builds. `EFTFitter.makeWorkspaceSM` remains a separate SM-specific path; this
