@@ -488,48 +488,124 @@ def test_cli_upstream_identity_override_is_opaque(tmp_path, monkeypatch, capfd):
     }
 
 
-def test_software_commit_observation_does_not_probe_source_cleanliness(monkeypatch):
+@pytest.fixture
+def software_layout(tmp_path, monkeypatch):
+    cmssw_base = tmp_path / "cmssw"
+    source = cmssw_base / "src/HiggsAnalysis/CombinedLimit/scripts/text2workspace.py"
+    runtime = cmssw_base / "bin/synthetic_arch/text2workspace.py"
+    source.parent.mkdir(parents=True)
+    runtime.parent.mkdir(parents=True)
+    source.write_bytes(b"Combine source script")
+    runtime.write_bytes(source.read_bytes())
+    monkeypatch.setenv("CMSSW_BASE", str(cmssw_base))
+    monkeypatch.setenv("CMSSW_VERSION", "CMSSW_SYNTHETIC")
+    monkeypatch.setenv("SCRAM_ARCH", "synthetic_arch")
     calls = []
 
     def observed_run(argv, **kwargs):
         calls.append(argv)
-        return SimpleNamespace(stdout="a" * 40 + "\n")
-
-    monkeypatch.setattr(workspace_builder.subprocess, "run", observed_run)
-    monkeypatch.setenv("CMSSW_BASE", "/synthetic/cmssw")
-    monkeypatch.setattr(workspace_builder.shutil, "which", lambda name: "/synthetic/cmssw/src/HiggsAnalysis/CombinedLimit/scripts/text2workspace.py")
-    workspace_builder._observed_software(WorkspaceBuildConfig("card", "plugin", "ws"))
-    assert all(argv[3:] == ["rev-parse", "HEAD"] for argv in calls)
-
-
-def test_observed_software_uses_exact_git_commits(monkeypatch):
-    calls = []
-
-    def observed_run(argv, **kwargs):
-        calls.append(argv)
+        if argv[3:] == ["rev-parse", "--show-toplevel"]:
+            return SimpleNamespace(stdout=str(source.parents[1]) + "\n")
         commit = "a" * 40 if "EFTFit" in argv[2] else "b" * 40
         return SimpleNamespace(stdout=commit + "\n")
 
     monkeypatch.setattr(workspace_builder.subprocess, "run", observed_run)
-    monkeypatch.setenv("CMSSW_BASE", "/synthetic/cmssw")
-    monkeypatch.setattr(workspace_builder.shutil, "which", lambda name: "/synthetic/cmssw/src/HiggsAnalysis/CombinedLimit/scripts/text2workspace.py")
-    monkeypatch.setenv("CMSSW_VERSION", "CMSSW_SYNTHETIC")
-    monkeypatch.setenv("SCRAM_ARCH", "synthetic_arch")
+    return source, runtime, calls
+
+
+def test_software_commit_observation_does_not_probe_source_cleanliness(software_layout, monkeypatch):
+    source, _, calls = software_layout
+    monkeypatch.setattr(workspace_builder.shutil, "which", lambda name: str(source))
+    workspace_builder._observed_software(WorkspaceBuildConfig("card", "plugin", "ws"))
+    assert all(argv[3:] in (["rev-parse", "HEAD"], ["rev-parse", "--show-toplevel"])
+               for argv in calls)
+
+
+def test_observed_software_accepts_source_tree_and_records_identity(software_layout, monkeypatch):
+    source, _, calls = software_layout
+    monkeypatch.setattr(workspace_builder.shutil, "which", lambda name: str(source))
     observed = workspace_builder._observed_software(
         WorkspaceBuildConfig("card", "EFTFit.Fitter.EFTModel:eftmodel", "ws"))
     assert observed["eftfit_commit"] == "a" * 40
     assert observed["combined_limit_commit"] == "b" * 40
     assert observed["cmssw_release"] == "CMSSW_SYNTHETIC"
-    assert len(calls) == 2
-    assert all(argv[3:] == ["rev-parse", "HEAD"] for argv in calls)
+    assert observed["text2workspace_executable"] == str(source)
+    assert observed["text2workspace_source_script"] == str(source)
+    assert observed["text2workspace_executable_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert observed["text2workspace_source_sha256"] == observed["text2workspace_executable_sha256"]
+    assert len(calls) == 3
 
 
-def test_qualified_provenance_rejects_shadowed_executable(monkeypatch):
-    monkeypatch.setenv("CMSSW_BASE", "/synthetic/cmssw")
-    monkeypatch.setattr(workspace_builder.shutil, "which", lambda name: "/other/text2workspace.py")
-    with pytest.raises(RuntimeError, match="does not resolve"):
+def test_observed_software_accepts_identical_cmssw_runtime(software_layout, monkeypatch):
+    source, runtime, _ = software_layout
+    monkeypatch.setattr(workspace_builder.shutil, "which", lambda name: str(runtime))
+    observed = workspace_builder._observed_software(WorkspaceBuildConfig("card", "plugin", "ws"))
+    assert observed["text2workspace_executable"] == str(runtime)
+    assert observed["text2workspace_source_script"] == str(source)
+    assert observed["text2workspace_executable_sha256"] == observed["text2workspace_source_sha256"]
+
+
+def test_observed_software_rejects_cmssw_runtime_content_mismatch(software_layout, monkeypatch):
+    _, runtime, _ = software_layout
+    runtime.write_bytes(b"unrelated implementation")
+    monkeypatch.setattr(workspace_builder.shutil, "which", lambda name: str(runtime))
+    with pytest.raises(RuntimeError, match="differs from the observed CombinedLimit source"):
+        workspace_builder._observed_software(WorkspaceBuildConfig("card", "plugin", "ws"))
+
+
+def test_qualified_provenance_rejects_shadowed_executable(software_layout, tmp_path, monkeypatch):
+    source, _, _ = software_layout
+    shadowed = tmp_path / "user-bin/text2workspace.py"
+    shadowed.parent.mkdir()
+    shadowed.write_bytes(source.read_bytes())
+    monkeypatch.setattr(workspace_builder.shutil, "which", lambda name: str(shadowed))
+    with pytest.raises(RuntimeError, match="outside the observed CombinedLimit and CMSSW runtime"):
         workspace_builder._observed_software(WorkspaceBuildConfig(
             "card", "EFTFit.Fitter.EFTModel:eftmodel", "workspace.root"))
+
+
+def test_observed_software_rejects_missing_runtime(software_layout, monkeypatch):
+    monkeypatch.setattr(workspace_builder.shutil, "which", lambda name: None)
+    with pytest.raises(RuntimeError, match="executable is missing"):
+        workspace_builder._observed_software(WorkspaceBuildConfig("card", "plugin", "ws"))
+
+
+def test_observed_software_rejects_missing_source(software_layout, monkeypatch):
+    source, runtime, _ = software_layout
+    source.unlink()
+    monkeypatch.setattr(workspace_builder.shutil, "which", lambda name: str(runtime))
+    with pytest.raises(RuntimeError, match="Expected a regular file"):
+        workspace_builder._observed_software(WorkspaceBuildConfig("card", "plugin", "ws"))
+
+
+def test_observed_software_rejects_source_symlink_outside_combinedlimit(software_layout, tmp_path):
+    source, _, _ = software_layout
+    elsewhere = tmp_path / "unrelated_source.py"
+    elsewhere.write_bytes(source.read_bytes())
+    source.unlink()
+    source.symlink_to(elsewhere)
+    with pytest.raises(RuntimeError, match="source script resolves outside CombinedLimit"):
+        workspace_builder._observed_software(WorkspaceBuildConfig("card", "plugin", "ws"))
+
+
+def test_observed_software_rejects_runtime_symlink_outside_cmssw(software_layout, tmp_path, monkeypatch):
+    source, runtime, _ = software_layout
+    elsewhere = tmp_path / "unrelated_runtime.py"
+    elsewhere.write_bytes(source.read_bytes())
+    runtime.unlink()
+    runtime.symlink_to(elsewhere)
+    monkeypatch.setattr(workspace_builder.shutil, "which", lambda name: str(runtime))
+    with pytest.raises(RuntimeError, match="outside the observed CombinedLimit and CMSSW runtime"):
+        workspace_builder._observed_software(WorkspaceBuildConfig("card", "plugin", "ws"))
+
+
+def test_observed_software_rejects_unresolved_combinedlimit_repository(software_layout, monkeypatch):
+    _, runtime, _ = software_layout
+    monkeypatch.setattr(workspace_builder.shutil, "which", lambda name: str(runtime))
+    monkeypatch.setattr(workspace_builder.subprocess, "run",
+                        lambda argv, **kwargs: SimpleNamespace(stdout="/unrelated/repository\n"))
+    with pytest.raises(RuntimeError, match="source identity does not resolve"):
+        workspace_builder._observed_software(WorkspaceBuildConfig("card", "plugin", "ws"))
 
 
 def test_software_commit_is_observed_once_without_currentness_gate(tmp_path, monkeypatch):

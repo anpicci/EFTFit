@@ -139,9 +139,31 @@ def _observed_software(config):
         raise RuntimeError("CMSSW_BASE is required for qualified build provenance")
     combined_limit = Path(cmssw_base) / "src/HiggsAnalysis/CombinedLimit"
     expected_executable = combined_limit / "scripts/text2workspace.py"
+    source_identity = file_identity(expected_executable)
+    if os.path.commonpath((os.path.realpath(combined_limit), source_identity["resolved_path"])) != os.path.realpath(combined_limit):
+        raise RuntimeError("text2workspace source script resolves outside CombinedLimit")
     observed_executable = shutil.which(config.executable)
-    if not observed_executable or os.path.realpath(observed_executable) != os.path.realpath(expected_executable):
-        raise RuntimeError("text2workspace executable does not resolve to the observed CombinedLimit tree")
+    if not observed_executable:
+        raise RuntimeError("text2workspace executable is missing")
+    executable_identity = file_identity(observed_executable)
+    source_execution = executable_identity["resolved_path"] == source_identity["resolved_path"]
+    scram_arch = os.environ.get("SCRAM_ARCH")
+    runtime_executable = (Path(cmssw_base) / "bin" / scram_arch / "text2workspace.py"
+                          if scram_arch else None)
+    cmssw_execution = (runtime_executable is not None and
+                       Path(observed_executable).absolute() == runtime_executable.absolute() and
+                       executable_identity["resolved_path"] == str(runtime_executable.absolute()))
+    if not (source_execution or cmssw_execution):
+        raise RuntimeError("text2workspace executable is outside the observed CombinedLimit and CMSSW runtime locations")
+    if executable_identity["sha256"] != source_identity["sha256"]:
+        raise RuntimeError("text2workspace executable differs from the observed CombinedLimit source script")
+
+    source_root = subprocess.run(
+        ["git", "-C", str(combined_limit), "rev-parse", "--show-toplevel"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    if os.path.realpath(source_root) != os.path.realpath(combined_limit):
+        raise RuntimeError("CombinedLimit source identity does not resolve to its own repository")
 
     def commit(path):
         result = subprocess.run(
@@ -157,8 +179,11 @@ def _observed_software(config):
         "eftfit_commit": commit(eftfit),
         "combined_limit_commit": commit(combined_limit),
         "cmssw_release": os.environ.get("CMSSW_VERSION"),
-        "scram_arch": os.environ.get("SCRAM_ARCH"),
-        "text2workspace_executable": os.path.realpath(observed_executable),
+        "scram_arch": scram_arch,
+        "text2workspace_executable": executable_identity["resolved_path"],
+        "text2workspace_executable_sha256": executable_identity["sha256"],
+        "text2workspace_source_script": source_identity["resolved_path"],
+        "text2workspace_source_sha256": source_identity["sha256"],
     }
     if "CombineHarvester" in config.plugin:
         observed["combine_harvester_commit"] = commit(Path(cmssw_base) / "src/CombineHarvester")
