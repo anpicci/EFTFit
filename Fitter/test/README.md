@@ -1,3 +1,23 @@
+# Maintained 1D consumer tests
+
+`test_scan_1d_consumer.py` exercises synthetic grid geometry, malformed ROOT
+inputs, canonical result resolution, legacy plotting/interval APIs, and display
+scaling. It uses NumPy, uproot, Matplotlib, PyYAML, and pytest, without Combine
+or PyROOT. Run from the repository root in an existing suitable runtime:
+
+```bash
+python -m pytest -q Fitter/test/test_scan_1d_consumer.py --basetemp=/path/to/diagnostics/test_outputs
+```
+
+Use a fresh diagnostics path; pytest owns its temporary output directory.
+Figures and tiny generated ROOT fixtures remain test artifacts, never production
+inputs. The tests do not run scans or submit jobs. See the
+[consumer contract](../../docs/how_to/run_configured_1d.md#structured-1d-results-and-the-plotting-api)
+for open/disconnected intervals, asymptotic reference thresholds, metadata
+authority, and compatibility limits.
+
+# Historical installation and submission examples
+
 # TL;DR
 1. If you want a fresh install, please `cd` to a directory where CMSSW is NOT installed
 2. If you already have CMSSW 10_2_13 installed, please make sure you run `cmsenv` in the base directory first.<br>
