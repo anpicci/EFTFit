@@ -13,7 +13,7 @@ from EFTFit.Fitter.execution_provenance import resolve_canonical_aggregate
 import numpy as np
 
 from EFTFit.Fitter.scan_1d import (
-    read_scan, combine_scans, legacy_interval_row, interval_width_ratio,
+    read_scan, combine_scans, interval_width_ratio,
     canonicalize_entries, ScanEntry,
 )
 from EFTFit.Fitter.scan_1d_plot import DisplayConfig, render_curves, render_summary
@@ -195,6 +195,8 @@ class EFTPlot(object):
         postfix = options.pop('postfix', '')
         job_set_ids = options.pop('job_set_ids', {})
         common_reference = options.pop('common_reference', False)
+        failed_point_policy = options.pop('failed_point_policy', 'mask')
+        family = options.pop('family', 'unspecified')
         if options:
             raise TypeError("unknown result options: {}".format(sorted(options)))
         names = [base_name_lst] if isinstance(base_name_lst, str) else list(base_name_lst)
@@ -209,7 +211,7 @@ class EFTPlot(object):
             else:
                 result_path = resolve_canonical_aggregate(name, job_set_ids.get(name), directory)
             paths.append(result_path)
-        return combine_scans([read_scan(path, wc) for path in paths], common_reference=common_reference)
+        return combine_scans([read_scan(path, wc, failed_point_policy=failed_point_policy, family=family) for path in paths], common_reference=common_reference)
 
     def _selected_wcs(self, values):
         selected = list(values or self.wcs)
@@ -242,7 +244,9 @@ class EFTPlot(object):
         Structured metadata and normalized grid curves: read_scan_result().
         """
         scan = self.read_scan_result(base_name_lst, wc, **kwargs)
-        entries = scan.points if unique else scan.raw_entries
+        if scan.invalid_entries:
+            raise ValueError("plain arrays cannot preserve invalid-point topology/provenance; use read_scan_result")
+        entries = scan.valid_points if unique else scan.raw_entries
         return [[entry.coordinate for entry in entries], [2 * entry.delta_nll for entry in entries]]
 
 
@@ -254,6 +258,7 @@ class EFTPlot(object):
 
 
     def LLPlot1DEFT(self, name_lst=['.test'], frozen=False, wc='', log=False, final=False, **kwargs):
+        kwargs.setdefault('family', 'frozen' if frozen else 'profiled')
         scan = self.read_scan_result(name_lst, wc, **kwargs)
         name = '{}1DNLL{}'.format(wc, '_log' if log else '')
         rendered = render_curves((scan,), ('Others fixed' if frozen else 'Others profiled',),
@@ -277,7 +282,7 @@ class EFTPlot(object):
     def clean_duplicates(self, graphwcs, graphnlls):
         if len(graphwcs) != len(graphnlls):
             raise ValueError("coordinate and likelihood lengths differ")
-        scan = canonicalize_entries('coordinate', [ScanEntry(x, y / 2, 'grid') for x, y in zip(graphwcs, graphnlls)])
+        scan = canonicalize_entries('coordinate', [ScanEntry(x, y / 2, 'grid') for x, y in zip(graphwcs, graphnlls)], failed_point_policy='error')
         return [[point.coordinate for point in scan.points], [2 * point.delta_nll for point in scan.points]]
 
     def OverlayLLPlot1DEFT(self,**kwargs):
@@ -290,9 +295,11 @@ class EFTPlot(object):
         thresholds = tuple(kwargs.pop('nll_{}sigma'.format(index), index ** 2) for index in (1, 2, 3))
         ceiling = kwargs.pop('ceiling', 12)
         common_reference = kwargs.pop('common_reference', self.result_options.get('common_reference', False))
+        failed_point_policy = kwargs.pop('failed_point_policy', self.result_options.get('failed_point_policy', 'mask'))
         options = []
         for family in (1, 2):
-            current = {'common_reference': common_reference}
+            current = {'common_reference': common_reference, 'failed_point_policy': failed_point_policy,
+                       'family': 'profiled' if family == 1 else 'frozen'}
             for public, internal in (('dir', 'dir_path'), ('pf', 'postfix'), ('job_set_ids', 'job_set_ids')):
                 key = public + str(family)
                 if key in kwargs:
@@ -1347,7 +1354,10 @@ class EFTPlot(object):
         best = []
 
         fits_float = self.getIntervalFits(basename_lst=name)
-        fits = {lst[0] : lst[1] for lst in fits_float}
+        if any(len(row['scan'].minima) != 1 or row['scan'].minimum_status == 'MINIMUM_UNRESOLVED'
+               for row in fits_float):
+            raise ValueError("grid2DWC requires one resolved supplied-data minimum per WC")
+        fits = {row['scan'].wc: row['scan'].minima[0] for row in fits_float}
 
         for wc in self.wcs:
             best.append(self.grid2DWC(name, wc, fits))
@@ -1482,7 +1492,7 @@ class EFTPlot(object):
         sp.call(['mv', 'index.html', 'Histos{}/'.format(basenamegrid)])
 
     def getIntervalFits(self,**kwargs):
-        """Legacy list adapter, or structured per-WC summaries with structured=True.
+        """Structured per-WC scan and interval summaries.
 
         siginterval=1/2 selects asymptotic reference thresholds 1/4.
         nll_max remains an explicit numerical override for siginterval=2.
@@ -1495,12 +1505,11 @@ class EFTPlot(object):
             raise ValueError("siginterval must be 1 or 2; use threshold for an explicit numerical level")
         nll_max = kwargs.pop('nll_max', 4)
         threshold = kwargs.pop('threshold', 1 if siginterval == 1 else nll_max)
-        structured = kwargs.pop('structured', False)
         results = []
         for wc in params:
             scan = self.read_scan_result(self.AppendStrToItemsInLst(basenames, '.' + wc), wc, **kwargs)
             intervals = scan.intervals(threshold)
-            results.append({'scan': scan, 'intervals': intervals} if structured else legacy_interval_row(scan, intervals))
+            results.append({'scan': scan, 'intervals': intervals, 'failed_points': scan.failed_points})
         return results
 
     def BestScanPlot(self, basename_float_lst=[''], basename_freeze_lst=[''], final=False, titles = ['Others profiled', 'Others fixed to SM'], filename='', wcs=[], printFOM=False, asimov_plotstyle_flag=False, **kwargs):
@@ -1510,6 +1519,8 @@ class EFTPlot(object):
         options2 = dict(kwargs.pop('frozen_options', {}))
         options1 = dict(kwargs, **options1)
         options2 = dict(kwargs, **options2)
+        options1.setdefault('family', 'profiled')
+        options2.setdefault('family', 'frozen')
         rows = [(wc,
                  self.read_scan_result(self.AppendStrToItemsInLst(names1, '.' + wc), wc, **options1),
                  self.read_scan_result(self.AppendStrToItemsInLst(names2, '.' + wc), wc, **options2))

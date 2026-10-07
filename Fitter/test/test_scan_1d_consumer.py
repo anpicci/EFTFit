@@ -16,7 +16,7 @@ import yaml
 fitter_dir = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(fitter_dir / "python"))
 from scan_1d import (ScanEntry, canonicalize_entries, scan_from_columns, read_scan,
-                     combine_scans, extract_intervals, legacy_interval_row,
+                     combine_scans, extract_intervals,
                      nesting_differences, interval_width_ratio)
 
 
@@ -41,9 +41,7 @@ def test_two_disconnected_components_and_two_local_minima():
     assert bounds(result) == [(-2.25, -1.75), (1.75, 2.25)]
     assert result.local_minima == (-2, 2)
     assert scan.sampled_grid_minima == (-2, 2)
-    with pytest.warns(RuntimeWarning, match="leftmost"):
-        row = legacy_interval_row(scan, result)
-    assert row == ["c", -2, [-2.25, 1.75], [-1.75, 2.25], [-2, 2]]
+
 
 
 @pytest.mark.parametrize("y, expected", [([0, 0, 2], [(None, 1.5)]), ([2, 0, 0], [(0.5, None)]), ([0, 0, 0], [(None, None)])])
@@ -56,8 +54,7 @@ def test_open_intervals_and_no_crossing(y, expected):
 def test_missing_crossings_and_insufficient_resolution():
     assert extract_intervals([0, 1], [2, 3], 1).status == "no_sublevel_component"
     assert extract_intervals([0], [0], 1).status == "insufficient_resolution"
-    with pytest.raises(ValueError, match="cannot represent"):
-        legacy_interval_row(make_scan([0], [0]), extract_intervals([0], [0], 1))
+
 
 
 def test_exact_threshold_tangent_and_plateau():
@@ -71,7 +68,7 @@ def test_duplicate_minimum_is_deterministic_and_retains_special_entry():
                ScanEntry(0, 0, "special_fit"), ScanEntry(1, 3, "grid")]
     first = canonicalize_entries("c", entries)
     second = canonicalize_entries("c", reversed(entries))
-    assert first.points == second.points
+    assert [(p.coordinate, p.delta_nll) for p in first.points] == [(p.coordinate, p.delta_nll) for p in second.points]
     assert first.points[0].delta_nll == 0
     assert first.grid_points[0].delta_nll == 2
     assert first.curve_points[0].delta_nll == 0
@@ -90,10 +87,9 @@ def test_unsorted_and_grid_minimum_below_special_fit():
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
-def test_nonfinite_rejection(value):
+def test_nonfinite_classification_and_array_rejection(value):
     for x, y in (([0, value], [0, 1]), ([0, 1], [0, value])):
-        with pytest.raises(ValueError, match="finite"):
-            make_scan(x, y)
+        assert len(make_scan(x, y).invalid_entries) == 1
         with pytest.raises(ValueError, match="finite"):
             extract_intervals(x, y, 1)
 
@@ -120,7 +116,6 @@ def write_root(path, columns=None, tree="limit"):
     ({"deltaNLL": [0]}, "limit", "branch c"),
     ({"c": [0]}, "limit", "branch deltaNLL"),
     ({"c": [], "deltaNLL": []}, "limit", "empty"),
-    ({"c": [0], "deltaNLL": [float("nan")]}, "limit", "finite"),
 ])
 def test_missing_root_tree_branches_and_malformed_rows(tmp_path, columns, tree, message):
     path = write_root(tmp_path / "bad.root", columns, tree)
@@ -180,12 +175,12 @@ def test_multiple_files_require_explicit_reference_contract():
     assert combine_scans([scan, scan], common_reference=True).duplicate_coordinates == ((-1, 2), (0, 2), (1, 2))
 
 
-def test_more_than_two_components_and_open_legacy_mapping():
+def test_more_than_two_components_and_open_structured_boundaries():
     scan = make_scan(range(7), [0, 2, 0, 2, 0, 2, 0])
-    with pytest.warns(RuntimeWarning):
-        row = legacy_interval_row(scan, scan.intervals(1))
-    assert len(row[2]) == len(row[3]) == 4
-    assert row[2][0] == -999 and row[3][-1] == 999
+    result = scan.intervals(1)
+    assert len(result.components) == 4
+    assert result.components[0].lower.value is None
+    assert result.components[-1].upper.value is None
 
 
 def test_width_ratio_has_defined_domain():
@@ -239,8 +234,8 @@ def test_compatibility_arrays_and_interval_siginterval(plot_module, tmp_path):
     write_root(tmp_path / "higgsCombine.p.c.MultiDimFit.mH120.root")
     x, y = plotter.GetWCsNLLFromRoot([".p.c"], "c", unique=True)
     assert x == [-2, -1, 0, 1, 2] and y == [4, 1, 0, 1, 4]
-    assert plotter.getIntervalFits(basename_lst=[".p"], siginterval=1) == [["c", 0, [-1], [1]]]
-    summaries = plotter.getIntervalFits(basename_lst=[".p"], siginterval=2, structured=True)
+    assert bounds(plotter.getIntervalFits(basename_lst=[".p"], siginterval=1)[0]["intervals"]) == [(-1, 1)]
+    summaries = plotter.getIntervalFits(basename_lst=[".p"], siginterval=2)
     assert summaries[0]["intervals"].threshold == 4
     assert summaries[0]["intervals"].semantics == "asymptotic_reference"
 
@@ -327,7 +322,7 @@ def test_parse_nll_helpers_use_core_and_validate_branches(plot_module, tmp_path)
     with pytest.raises(ValueError, match="poi_lst"):
         module.get_best_points_by_wc([{"c": 0}])
     assert module.get_best_points_by_wc([{"c": 0}], ["c"]) == {"c": [0]}
-    with pytest.raises(ValueError, match="finite"):
+    with pytest.raises(ValueError, match="invalid evaluation"):
         module.get_unique_points({"x": [0], "nll": [float("nan")]}, "x", "nll")
 
 

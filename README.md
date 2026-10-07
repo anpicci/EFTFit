@@ -31,3 +31,9 @@ the [configured 1D workflow](docs/how_to/run_configured_1d.md).
 Older TOP-19-001, TOP-22-006, AAC, CRAB-first, hard-coded impacts, and postfit
 material is indexed under [historical documentation](docs/historical/README.md).
 It is not the recommended TOP-26-006 workflow.
+
+The modern 1D consumer excludes producer-invalid points from all physical
+likelihood calculations. Its `--failed-point-policy {mask,drop,error}` setting
+controls presentation while preserving gaps and recovery provenance. Intervals
+are structured; the historical lossy interval list adapter is retired. See the
+[failed-point contract](docs/how_to/run_configured_1d.md#failed-evaluation-points-and-recovery).

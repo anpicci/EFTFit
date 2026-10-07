@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Historical best-point helpers. WC membership must be supplied by the caller.
-from EFTFit.Fitter.scan_1d import canonicalize_entries, ScanEntry, finite
+from EFTFit.Fitter.scan_1d import canonicalize_entries, ScanEntry, finite, read_scan, FAILED_POINT_POLICIES
 from EFTFit.Fitter.execution_provenance import resolve_canonical_aggregate
 
 ########################################################################
@@ -58,7 +58,7 @@ def get_unique_points(in_dict,scan_var,minimize_var):
     if any(len(values) != size for values in in_dict.values()):
         raise ValueError("unequal column lengths")
     scan = canonicalize_entries(scan_var, [ScanEntry(x, y, "grid", locator=str(index))
-        for index, (x, y) in enumerate(zip(in_dict[scan_var], in_dict[minimize_var]))])
+        for index, (x, y) in enumerate(zip(in_dict[scan_var], in_dict[minimize_var]))], failed_point_policy="error")
     # Companion columns follow the winning entry; every coordinate/NLL is validated.
     indices = [int(point.entries[0].locator) for point in scan.points]
     return {key: [values[index] for index in indices] for key, values in in_dict.items()}
@@ -116,7 +116,9 @@ def plotter_wrapper(lst_of_bestfit_dicts, poi_lst=None):
 # Find the best points in EFT space
 def get_best_nll_eft_point(in_dict,poi_lst):
     best_point_dict = {}
-    best_nll_idx = in_dict["deltaNLL"].index(min(in_dict["deltaNLL"]))
+    scan = canonicalize_entries("entry_index", [ScanEntry(index, value, "grid")
+        for index, value in enumerate(in_dict["deltaNLL"])], failed_point_policy="error")
+    best_nll_idx = int(scan.minima[0])
     for poi_name in poi_lst + ["deltaNLL"]:
         poi_val = in_dict[poi_name]
         best_point_dict[poi_name] = in_dict[poi_name][best_nll_idx]
@@ -138,21 +140,35 @@ def get_best_points_by_wc(lst_of_best_point_dicts, poi_lst=None):
 
 
 ########################################################################
-def main():
+def argument_parser():
     import argparse
-    from EFTFit.Fitter.wc_fit_config import load_fit_config
-    parser = argparse.ArgumentParser(description="Inspect canonical scan best points using explicit WC metadata")
+    parser = argparse.ArgumentParser(description="Inspect structured canonical 1D results and recovery coordinates")
     parser.add_argument("--fit-config", required=True)
     parser.add_argument("--basename", required=True)
-    args = parser.parse_args()
-    poi_lst = list(load_fit_config(args.fit_config).scientific_wcs)
-    bestfit_dict = {}
-    for poi_name in poi_lst:
-        root_dict = get_vals_from_root_file(find_root_file_path(args.basename, poi_name),
-                                           make_branches_lst(poi_lst, poi_name), True)
-        unique = get_unique_points(root_dict, poi_name, "deltaNLL")
-        bestfit_dict[poi_name] = get_best_nll_eft_point(unique, poi_lst)
-    plotter_wrapper(bestfit_dict, poi_lst)
+    parser.add_argument("--failed-point-policy", choices=FAILED_POINT_POLICIES, default="mask",
+                        help="invalid-point presentation: mask (default), drop, or stop on error; never bridge gaps")
+    return parser
+
+
+def main():
+    import json
+    import math
+    from dataclasses import asdict
+    from EFTFit.Fitter.wc_fit_config import load_fit_config
+    args = argument_parser().parse_args()
+    results = []
+    for wc in load_fit_config(args.fit_config).scientific_wcs:
+        scan = read_scan(find_root_file_path(args.basename, wc), wc,
+                         failed_point_policy=args.failed_point_policy, family=args.basename)
+        results.append({"wc": wc, "minima": scan.minima, "minimum_status": scan.minimum_status,
+                        "intervals": [asdict(scan.intervals(level)) for level in (1, 4)],
+                        "failed_point_policy": scan.failed_point_policy,
+                        "points": [{"coordinate": point.coordinate if math.isfinite(point.coordinate) else None,
+                                    "twice_delta_nll": point.twice_delta_nll, "status": point.status}
+                                   for point in scan.points],
+                        "curve_segments": [[point.coordinate for point in segment] for segment in scan.curve_segments],
+                        "failed_points": scan.failed_points})
+    print(json.dumps(results, allow_nan=False, indent=2))
 
 
 if __name__ == "__main__":

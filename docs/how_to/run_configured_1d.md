@@ -142,7 +142,7 @@ plotter = EFTPlot(
 scan = plotter.read_scan_result([".top_26_006.profiled.ctG"], "ctG")
 reference_interval = scan.intervals(1.0)
 summaries = plotter.getIntervalFits(
-    basename_lst=[".top_26_006.profiled"], params=["ctG"], structured=True,
+    basename_lst=[".top_26_006.profiled"], params=["ctG"],
 )
 plotter.OverlayLLPlot1DEFT(
     name1_lst=[".top_26_006.profiled.ctG"],
@@ -165,23 +165,25 @@ inferred from a filename or an old analysis.
 
 Input semantics:
 
-- Missing files/tree/required branches, empty results, and nonfinite coordinates,
-  likelihoods, or tracked parameters raise errors. Malformed entries are never
-  silently discarded. A result cannot mix toys.
+- Missing files/tree/required branches, empty results, and malformed metadata
+  raise errors. Nonfinite required coordinates/likelihoods are hard-invalid rows;
+  tracked parameters must be finite on otherwise valid rows. A result cannot mix toys.
 - `quantileExpected == -1` identifies special fit entries in the supported
   MultiDimFit **grid** contract. Other nonnegative quantiles identify grid rows.
   Other negative quantiles are rejected. Without this branch, rows are explicitly
   unclassified and treated as grid with a warning; no fit minimum is inferred.
   These inputs must be grid outputs; the reader does not certify the fit algorithm,
   convergence, or result-member completeness from branch names alone.
-- `raw_entries`, `grid_entries`, and `special_entries` preserve the input rows,
-  tracked parameters, and file/tree/entry locators. `points` deduplicates every
-  coordinate using its minimum raw deltaNLL. `grid_points` retains the sampled
-  grid minima independently. Duplicate coordinates and multiplicities are recorded.
+- `raw_entries` preserves all input rows, tracked parameters, and file/tree/entry
+  locators. `grid_entries` and `special_entries` select valid rows of each kind;
+  `invalid_entries` exposes the failed rows. `points` deduplicates coordinates
+  using the minimum **valid** raw deltaNLL and, under mask, includes invalid-only
+  coordinates with no physical value. `grid_points` retains valid sampled grid
+  minima independently. Duplicate coordinates and multiplicities are recorded.
 - `curve_points` uses canonical likelihoods at grid coordinates, including a
   coincident special entry. Off-grid special entries contribute to normalization
   but do not add artificial interval-resolution knots. Normalized values are
-  `2 * (raw_deltaNLL - minimum_raw_deltaNLL_of_all_supplied_entries)`.
+  `2 * (raw_deltaNLL - minimum_raw_deltaNLL_of_valid_supplied_entries)`.
 - `sampled_grid_minima` and `reported_fit_minima` are distinct. The latter are
   reported special-entry fit estimates, not certification of a continuous global
   minimum. All tied canonical minima are retained. ROOT entry order is irrelevant.
@@ -205,26 +207,93 @@ observed domain, **not** a physical infinite limit. Single-point input reports
 `no_sublevel_component`. A grid entirely below it returns an interval open on
 both sides. Exact threshold values at a domain edge are conservatively open.
 
-`getIntervalFits` preserves `[WC, best, lower_edges, upper_edges]`, with the
-historical fifth local-minima list for two components. `siginterval=1` and `2`
-select 2ΔNLL = 1 and 4. `nll_max` overrides the second threshold; `threshold`
-is an explicit numerical override. These are **asymptotic reference thresholds**.
-The familiar 1σ/2σ interpretation remains an asymptotic reference until Wilks
-and coverage qualification; the implementation does not establish coverage.
+`getIntervalFits` returns dictionaries containing `scan`, `intervals`, and
+`failed_points`. `siginterval=1` and `2` select 2ΔNLL = 1 and 4. `nll_max`
+overrides the second threshold; `threshold` is an explicit numerical override.
+These are **asymptotic reference thresholds**; the consumer does not establish
+Wilks validity or coverage. The lossy historical list adapter and its
+`structured` switch have been removed. Open or unresolved endpoints use `None`
+and a boundary reason, never numerical interval sentinels. The historical
+`2sigma_struct_maker_wrapper.py` is retired: its fixed campaign and endpoint
+selection could not represent unresolved/multiple components safely. Legacy
+execution remains on `py3Combine`. The best-coordinate caller uses structured
+results and requires one resolved supplied-data minimum.
 
-The default legacy adapter is deliberately lossy: it maps open lower/upper
-boundaries to -999/+999 **only in the returned compatibility lists**, with a
-warning. It selects the leftmost tied best point and warns for ties or more
-than two components. All components are retained, never truncated; old callers
-that assume at most two must use `structured=True` and handle each component.
-No-component/insufficient-resolution results cannot be represented as historical
-lists and raise an error. Use structured results for scientific interpretation.
-The historical `2sigma_struct_maker_wrapper.py` consumes this list shape and
-retains its historical analysis/execution assumptions; it is not a configured
-TOP-26-006 campaign consumer.
+### Failed evaluation points and recovery
+
+The sole user-facing policy option is **`--failed-point-policy {mask,drop,error}`**
+in `Fitter/scripts/parse_nll.py`. The same setting is passed programmatically as
+`failed_point_policy` to the core readers or through `EFTPlot.result_options`
+and result-method keywords. Default: `mask`. There are no boolean or
+sentinel-specific aliases.
+
+- `mask` retains invalid-only coordinates in `scan.points`, with status
+  `INVALID_EVALUATION_POINT` and `delta_nll=twice_delta_nll=None`. Curves break
+  there; an axis-relative cross can identify the coordinate without assigning
+  it a likelihood value.
+- `drop` omits these coordinates from `scan.points` and from plotted markers.
+  `invalid_entries`, `invalid_coordinates`, and `failed_points` still retain the
+  evidence. `curve_segments` has exactly the same breaks as mask.
+- `error` raises if **any** hard-invalid row exists, including one accompanied
+  by a valid duplicate. It is a strict workflow policy, not a physics override.
+
+Exactly `deltaNLL == 9990` is the supported 1D Combine NLL evaluation-error
+sentinel (`COMBINE_NLL_EVALUATION_ERROR_SENTINEL`). Nonfinite required coordinates
+or likelihoods are also hard-invalid. No other finite sentinel or soft-failure
+criterion is inferred. Large finite non-sentinel likelihood values remain valid.
+Each raw row retains its kind, status (`VALID_GRID_POINT`,
+`INVALID_EVALUATION_POINT`, or `SPECIAL_FIT_POINT`), raw value, coordinate,
+quantile when available, tracked parameters, source entry index, and locator.
+Only valid rows contribute to normalization, minima, canonical values, crossings,
+nesting, or widths. A valid duplicate repairs that coordinate; invalid duplicate
+rows remain diagnostics. All-invalid duplicates produce no physical value.
+
+`grid_points`, `valid_points`, and `curve_points` contain only physical values.
+**Use `curve_segments` to draw or interpolate**, since flattened valid collections
+cannot encode connectivity. A nonfinite coordinate cannot be placed on the grid:
+all knots are isolated conservatively and the minimum is unresolved. All-invalid
+input retains recovery evidence and has no normalization or minima.
+
+Intervals are constructed independently on each contiguous segment. A crossing
+blocked by a gap has `value=None`, kind `UNRESOLVED_DUE_TO_INVALID_POINT`, and a
+bracket containing the valid edge and invalid coordinate (or `None` when unknown).
+There is no interpolation or extrapolation across gaps. `topology_status` is
+`TOPOLOGY_INCOMPLETE` whenever an unrepaired gap remains, even if the central
+interval is usable. An isolated sublevel knot carries unresolved endpoints.
+
+`minimum_status` describes support for the minimum of supplied valid data, not
+proof of a continuous/global minimum inside an unobserved gap. With gaps, each
+candidate minimum must be enclosed by higher valid knots on a single segment;
+an unknown invalid coordinate or unrepaired failed special-fit row leaves it
+`MINIMUM_UNRESOLVED`. Otherwise, closed components containing all supplied-data
+minima are returned as `central_components`, with `central_status` equal to
+`RESOLVED_ON_VALID_SEGMENT`. A remote invalid tail can therefore leave a central
+interval usable. Full-tail/disconnected-component completeness remains unknown.
+`inference_status` distinguishes `VALID_COMPLETE`,
+`USABLE_WITH_INVALID_TAIL_POINTS`, `PARTIALLY_RESOLVED`, `MINIMUM_UNRESOLVED`, and
+`INTERVAL_UNRESOLVED`. Even a gap-free input can have unresolved scan-edge
+crossings. Mask/drop never change these scientific states.
+
+`failed_points` is a compact machine-readable recovery list with WC, coordinate,
+source/member locator and entry index, failure reason, and caller-supplied
+family/mode (`family`; `unspecified` if unknown). Nonfinite coordinates become
+JSON null with a raw-coordinate string; nonfinite producer values remain strings.
+The list also records whether a valid duplicate exists. The CLI emits this list
+alongside structured intervals. No retry, attempt selection, or replacement is
+performed. Campaign code owns those decisions.
+
+`nesting_differences` compares shared valid grid coordinates in the caller-proven
+common NLL reference, records unavailable invalid coordinates, and continues
+elsewhere. Its status is `UNRESOLVED` when either supplied minimum/reference is
+unresolved; otherwise missing coordinates yield `PARTIALLY_RESOLVED`. It never
+uses independently re-zeroed display values. The full-interval width ratio is
+undefined for incomplete topology or an unresolved minimum, even when a central
+component is usable.
 
 `GetWCsNLLFromRoot(..., unique=False)` returns raw coordinate and **raw
-2*deltaNLL** lists, including special entries. `unique=True` sorts coordinates
+2*deltaNLL** lists, including special entries, for fully valid inputs. Invalid
+rows cause this metadata-free adapter to raise and direct callers to `read_scan_result`; it cannot
+safely carry gap/provenance states. `unique=True` sorts coordinates
 and uses minimum raw deltaNLL. `LLPlot1DEFT`, `OverlayLLPlot1DEFT`,
 `BatchOverlayLLPlot1DEFT`, and `BestScanPlot` retain their original argument
 names and defaults. They now return structured results plus written paths.
@@ -236,10 +305,11 @@ directories/postfixes/identities and renders all 1/4-threshold components.
 Display scale factors belong only in `display_config["scales"]`, for example
 `{"ctG": 5}` if explicitly desired. They annotate axis/row labels and transform
 only rendered coordinates. Scientific entries, intervals, and width ratios
-remain in unscaled physical units. Open interval ends use arrows.
+remain in unscaled physical units. Open scan-boundary ends use arrows; invalid-gap
+ends use crosses at their valid edge.
 The optional FoM is **frozen interval width / profiled interval width** at the
-same threshold. It is omitted (`None`) for open or disconnected sets or a zero
-profiled width. It is descriptive, not a significance or coverage measure.
+same threshold. It is omitted (`None`) for incomplete topology, unresolved minima,
+open or disconnected sets, or a zero profiled width. It is descriptive, not a significance or coverage measure.
 
 The renderer writes PNG/PDF by default directly through Matplotlib (optional
 EPS/SVG); it does not create ROOT histograms or separate legend files. Existing

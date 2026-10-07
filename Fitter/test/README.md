@@ -122,3 +122,9 @@ Example:
 ```python
 fitter.retrieveGridScan('.11102022.EFT.Float.DNN.1M', batch='crab')
 ```
+
+Focused failed-point contracts are in `test_scan_1d_invalid_points.py`; run it
+with `test_scan_1d_consumer.py` using the repository's approved Python wrapper.
+They cover exact producer sentinel classification, policies, provenance,
+segment intervals, locally degraded comparisons, and actual renderer line data.
+No fit execution is involved. Synthetic ROOT/PNG files stay in pytest basetemp.
