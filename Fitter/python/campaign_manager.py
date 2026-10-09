@@ -15,6 +15,56 @@ def point_key(point):
     return point["scan_id"], point["point_index"]
 
 
+def planning_eligibility(operation, points, attempts, receipts, generation_id):
+    """Derive work from active-generation execution and scientific evidence."""
+    relevant_attempts = {attempt_id: attempt for attempt_id, attempt in attempts.items()
+                         if attempt["generation_id"] == generation_id}
+    collected = {receipt["attempt_id"] for receipt in receipts
+                 if receipt["generation_id"] == generation_id}
+    history = {}
+    for attempt_id, attempt in relevant_attempts.items():
+        for point in attempt["points"]:
+            history.setdefault(point_key(point), []).append((attempt_id, attempt))
+    by_point = {}
+    for receipt in receipts:
+        if receipt["generation_id"] == generation_id:
+            by_point.setdefault(point_key(receipt), []).append(receipt)
+
+    selected, deferred = [], []
+    for point in points:
+        key = point_key(point)
+        attempts_for_point = history.get(key, [])
+        point_receipts = by_point.get(key, [])
+        if point["canonical"] is not None or any(r["status"] == "accepted" for r in point_receipts):
+            reason = ("accepted_valid_candidate" if point["status"] == "accepted"
+                      else "canonical_reference_damaged")
+        elif any(a["dispatch"] and attempt_id not in collected for attempt_id, a in attempts_for_point):
+            reason = "not_yet_recoverable_dispatch_intent"
+        elif any(r["status"] == "unresolved" and r["reason"] == "PROMOTION_UNQUALIFIED_REFERENCE"
+                 for r in point_receipts):
+            reason = "promotion_unqualified_reference"
+        elif operation == "plan":
+            reason = ("initial_unattempted" if not point_receipts and
+                      not any(a["dispatch"] for _, a in attempts_for_point)
+                      else "already_attempted")
+        elif not point_receipts:
+            reason = "not_yet_recoverable_plan_only" if attempts_for_point else "unattempted"
+        elif operation == "retry":
+            reason = "terminal_result_requires_repeat" if point["status"] in ("missing", "invalid", "unresolved") else "not_yet_recoverable"
+        else:
+            reason = ("numerical_failure_strategy_applicable"
+                      if any(r["status"] == "invalid" and r["reason"] == "invalid evaluation point (scan_1d)"
+                             for r in point_receipts) and point["status"] == "invalid"
+                      and point["reason"] == "invalid evaluation point (scan_1d)"
+                      else "no_confirmed_numerical_failure")
+        if reason in ("initial_unattempted", "terminal_result_requires_repeat", "numerical_failure_strategy_applicable"):
+            selected.append(point)
+        else:
+            deferred.append({"scan_id": point["scan_id"], "point_index": point["point_index"],
+                             "reason": reason, "status": point["status"]})
+    return selected, deferred
+
+
 def verify_reference(reference):
     if sha256_file(reference["resolved_path"]) != reference["sha256"]:
         raise ValueError("referenced artifact changed: " + reference["resolved_path"])
@@ -180,9 +230,15 @@ def plan(root, campaign_id, operation="plan", backend=None, strategy=None, dry_r
         provider = select_backend(backend if backend is not None else spec["default_backend"], backends)
         if scan_id is not None and scan_id not in {p["scan_id"] for p in observed["points"]}:
             raise ValueError("unknown logical scan_id")
-        selected = [p for p in observed["points"] if p["status"] not in ("accepted", "running")
-                    and (scan_id is None or p["scan_id"] == scan_id)]
+        active, _, attempts, receipts = current_state(snapshot)
+        scoped = [p for p in observed["points"] if scan_id is None or p["scan_id"] == scan_id]
+        selected, deferred = planning_eligibility(operation, scoped, attempts, receipts,
+                                                  active["generation_id"])
         points = [{key: p[key] for key in ("scan_id", "wc", "mode", "point_index", "coordinate")} for p in selected]
+        if not points:
+            return {"operation": operation, "status": "no_eligible_points", "dry_run": dry_run,
+                    "campaign_id": campaign_id, "generation_id": active["generation_id"],
+                    "not_yet_recoverable": deferred}
         # Input identities are needed only by execution planning, never status/clone/restart.
         verify_reference(spec["package"])
         validate_workspace_identity(spec["workspace"])

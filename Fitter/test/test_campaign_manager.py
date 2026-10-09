@@ -192,6 +192,28 @@ def test_simultaneous_restart_cas_and_no_overwrite(campaign_inputs, record_prope
     record_property("concurrency_evidence", json.dumps({"replies": replies, "status": observed}, sort_keys=True))
 
 
+def test_condor_full_grid_009a_member_and_partial_fail_closed(campaign_inputs, eftfitter):
+    source, _, root = campaign_inputs
+    created = manager.create(root, source)
+    campaign_id = created["campaign_id"]
+    planned = manager.plan(root, campaign_id, backend="condor", dry_run=True)
+    job = planned["plan"]["jobs"][0]
+    assert job["point_indices"] == list(range(5))
+    assert job["argv"].count("--points") == 1
+    assert job["argv"].count("--split-points") == 1
+    assert job["argv"].count("--firstPoint") == job["argv"].count("--lastPoint") == 0
+    manifest = eftfitter._build_condor_provenance(job["scan_name"], job["argv"], 5, 5)
+    eftfitter._validate_condor_provenance(manifest, job["scan_name"])
+    assert manifest["job_set_id"] == job["job_set_id"]
+    assert [(m["first_point"], m["last_point"]) for m in manifest["expected_members"]] == [(0, 4)]
+    assert len({m["file_name"] for m in manifest["expected_members"]}) == 1
+    snapshot = state.campaign_store(root, campaign_id).read()
+    spec = snapshot["campaign"]["effective_spec"]
+    partial_request = dict(planned["request"], points=planned["request"]["points"][1:2])
+    with pytest.raises(ValueError, match="partial-grid planning is unqualified"):
+        condor_plan_backend().plan(partial_request, spec)
+
+
 @pytest.mark.parametrize("change,match", [
     ({"wc_ranges": {"c_one": [-9, 9]}}, "expected fields"),
     ({"fit_start_values": {"c_one": 1}}, "nonzero"),

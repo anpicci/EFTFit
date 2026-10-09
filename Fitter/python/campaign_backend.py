@@ -21,12 +21,14 @@ def runtime_identity():
                 "execution_provenance.py", "wc_fit_config.py", "inference_recipe.py", "scan_1d.py")}}
 
 
-def grid_argv(spec, point, first, last, strategy):
+def grid_argv(spec, point, first, last, strategy, *, include_bounds=True):
+    bounds = (["--firstPoint", str(first), "--lastPoint", str(last)]
+              if include_bounds else [])
     args = build_configured_grid_scan_command(fit_config(spec), spec["workspace"]["resolved_path"],
         name="", freeze=point["mode"] == "frozen", scan_params=[point["wc"]],
         points=spec["grid"]["points"], other=["--dataset", spec["dataset"]["name"],
         "--alignEdges", "1" if spec["grid"]["align_edges"] else "0",
-        "--firstPoint", str(first), "--lastPoint", str(last)])
+        *bounds])
     if strategy == "minimizer_strategy_1":
         args[args.index("--cminDefaultMinimizerStrategy=0")] = "--cminDefaultMinimizerStrategy=1"
     return args
@@ -42,6 +44,8 @@ class condor_plan_backend:
         for point in request["points"]:
             scans.setdefault(point["scan_id"], []).append(point)
         for scan_points in scans.values():
+            if self.name == "condor" and sorted(p["point_index"] for p in scan_points) != list(range(spec["grid"]["points"])):
+                raise ValueError("Condor partial-grid planning is unqualified: CombineTool and 009A require full-grid split ownership")
             # Each contiguous selected range is a distinct execution job basis.
             groups = []
             for point in scan_points:
@@ -54,7 +58,8 @@ class condor_plan_backend:
                 scan_name = ".campaign_" + digest({"campaign_id": request["campaign_id"],
                     "generation_id": request["generation_id"], "attempt_id": request["attempt_id"],
                     "scan_id": point["scan_id"], "first_point": first})
-                argv = grid_argv(spec, point, first, last, request["strategy"])
+                argv = grid_argv(spec, point, first, last, request["strategy"],
+                                 include_bounds=self.name != "condor")
                 argv += ["--job-mode", "condor", "--split-points", str(spec["grid"]["points"]), "--dry-run"]
                 job_set_id = compute_job_set_id("condor", scan_name, identity_semantic_argv(argv), spec["workspace"]["sha256"])
                 output_label = scan_name + ".job_" + job_set_id

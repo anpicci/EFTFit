@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 from test_campaign_manager import campaign_inputs, providers, eftfitter, snapshot_tree
+from python.campaign_backend import condor_plan_backend
 from python import campaign_state as state
 from python.execution_provenance import sha256_file
 
@@ -43,6 +44,30 @@ def run_attempt(invoke, campaign_id, backend, operation="plan", scan_id=None):
     return plan, result
 
 
+def test_pristine_and_plan_only_recovery_are_no_ops(campaign_inputs, providers, invoke):
+    source, _, root = campaign_inputs
+    campaign_id = invoke("create", source)["campaign_id"]
+    before = snapshot_tree(root)
+    assert len(invoke("plan", campaign_id, "--dry-run")["request"]["points"]) == 5
+    for operation in ("retry", "rescue"):
+        extra = ("--strategy", "minimizer_strategy_1") if operation == "rescue" else ()
+        result = invoke(operation, campaign_id, *extra)
+        assert result["status"] == "no_eligible_points"
+        assert {p["reason"] for p in result["not_yet_recoverable"]} == {"unattempted"}
+    assert snapshot_tree(root) == before
+    planned = invoke("plan", campaign_id)
+    before = snapshot_tree(root)
+    assert invoke("retry", campaign_id)["status"] == "no_eligible_points"
+    assert {p["reason"] for p in invoke("retry", campaign_id)["not_yet_recoverable"]} == {"not_yet_recoverable_plan_only"}
+    assert snapshot_tree(root) == before
+    invoke("dispatch", campaign_id, planned["request"]["attempt_id"])
+    before = snapshot_tree(root)
+    deferred = invoke("retry", campaign_id)
+    assert deferred["status"] == "no_eligible_points"
+    assert {p["reason"] for p in deferred["not_yet_recoverable"]} == {"not_yet_recoverable_dispatch_intent"}
+    assert snapshot_tree(root) == before
+
+
 def test_six_lifecycle_operations_mixed_backends_and_frozen_spec(campaign_inputs, providers, invoke, record_property):
     source, _, root = campaign_inputs
     initial = invoke("create", source)
@@ -52,6 +77,13 @@ def test_six_lifecycle_operations_mixed_backends_and_frozen_spec(campaign_inputs
     observed = invoke("status", campaign_id)
     assert [p["status"] for p in observed["points"]] == ["accepted", "invalid", "accepted", "unresolved", "accepted"]
     assert first["request"]["points"][1]["point_index"] == 1
+    before_condor = snapshot_tree(root)
+    assert "partial-grid planning is unqualified" in invoke("retry", campaign_id, "--backend", "condor", backend_map={"condor": condor_plan_backend()}, expected=2)["error"]
+    assert snapshot_tree(root) == before_condor
+    rescue = invoke("rescue", campaign_id, "--backend", "provider_b", "--strategy", "minimizer_strategy_1", "--dry-run")
+    assert [p["point_index"] for p in rescue["request"]["points"]] == [1]
+    assert rescue["request"]["numerical_difference"] == {"--cminDefaultMinimizerStrategy": {"before": 0, "after": 1}}
+    assert "--cminDefaultMinimizerStrategy=1" in rescue["plan"]["jobs"][0]["argv"]
     source.write_text("changed: original YAML no longer controls this campaign\n")
     retry, recovered = run_attempt(invoke, campaign_id, "provider_b", "retry")
     assert [p["point_index"] for p in retry["request"]["points"]] == [1, 3]
@@ -67,13 +99,12 @@ def test_six_lifecycle_operations_mixed_backends_and_frozen_spec(campaign_inputs
     assert observed["spec_digest"] == initial["spec_digest"]
     assert [p["status"] for p in observed["points"]] == ["accepted", "unresolved", "accepted", "unresolved", "accepted"]
     assert observed["attempts"][-1]["runtime"]["provider"] == "provider_b"
-    rescue = invoke("rescue", campaign_id, "--backend", "provider_b", "--strategy", "minimizer_strategy_1")
-    assert rescue["request"]["numerical_difference"] == {"--cminDefaultMinimizerStrategy": {"before": 0, "after": 1}}
-    assert "--cminDefaultMinimizerStrategy=1" in rescue["plan"]["jobs"][0]["argv"]
-    assert "keepFailures" not in str(rescue)
-    invoke("dispatch", campaign_id, rescue["request"]["attempt_id"])
-    rescue_receipts = invoke("collect", campaign_id, rescue["request"]["attempt_id"])
-    assert {r["reason"] for r in rescue_receipts["receipts"]} == {"PROMOTION_UNQUALIFIED_REFERENCE"}
+    before = snapshot_tree(root)
+    assert invoke("retry", campaign_id, "--backend", "provider_b")["status"] == "no_eligible_points"
+    rescue_after = invoke("rescue", campaign_id, "--backend", "provider_b", "--strategy", "minimizer_strategy_1")
+    assert rescue_after["status"] == "no_eligible_points"
+    assert {p["reason"] for p in rescue_after["not_yet_recoverable"] if p["point_index"] in (1, 3)} == {"promotion_unqualified_reference"}
+    assert snapshot_tree(root) == before
     invoke("rescue", campaign_id, "--strategy", "unknown", expected=2)
     cloned = invoke("clone", campaign_id)
     assert cloned["spec_digest"] == initial["spec_digest"]
@@ -88,7 +119,7 @@ def test_six_lifecycle_operations_mixed_backends_and_frozen_spec(campaign_inputs
     invoke("collect", campaign_id, first["request"]["attempt_id"], expected=2)
     record_property("mixed_provider_evidence", json.dumps({"initial": initial,
         "initial_plan": first, "retry_plan": retry, "recovered": recovered,
-        "status_after_retry": observed, "rescue_receipts": rescue_receipts,
+        "status_after_retry": observed, "rescue_after_recovery": rescue_after,
         "clone": cloned, "restart": restarted}, sort_keys=True))
 
 
@@ -111,7 +142,7 @@ def test_parallel_provider_scans_and_unsupported_localization(campaign_inputs, p
     before = snapshot_tree(root)
     invoke("retry", campaign_id, "--backend", "provider_b", expected=2)
     assert invoke("status", campaign_id) == observed
-    assert invoke("retry", campaign_id, "--backend", "provider_a", "--dry-run")["request"]["points"] == []
+    assert invoke("retry", campaign_id, "--backend", "provider_a", "--dry-run")["status"] == "no_eligible_points"
     assert before == snapshot_tree(root)
     record_property("parallel_provider_evidence", json.dumps({"plan_a": plan_a, "plan_b": plan_b,
         "status_after_both": observed, "state_unchanged_after_unavailable_provider": before == snapshot_tree(root)}, sort_keys=True))
@@ -127,6 +158,7 @@ def test_member_presence_is_not_scientific_acceptance(campaign_inputs, providers
     assert {p["status"] for p in observed["points"]} == {expected_status}
     plan = invoke("retry", initial["campaign_id"], "--backend", "provider_b", "--dry-run")
     assert [p["point_index"] for p in plan["request"]["points"]] == list(range(5))
+    assert invoke("rescue", initial["campaign_id"], "--backend", "provider_b", "--strategy", "minimizer_strategy_1")["status"] == "no_eligible_points"
 
 
 def test_dry_runs_read_only_for_every_mutation_and_status(campaign_inputs, providers, invoke):
@@ -174,6 +206,14 @@ def test_full_population_condor_planning_and_missing_provider(campaign_inputs, i
     plan = invoke("plan", campaign_id, "--backend", "condor", "--dry-run", backend_map=None)
     assert len(plan["plan"]["jobs"]) == 52
     assert plan["plan"]["capabilities"] == {"plan": True, "dispatch": False, "collect": False}
+    jobs = plan["plan"]["jobs"]
+    assert len({job["job_set_id"] for job in jobs}) == len(jobs)
+    assert len({job["argv"][job["argv"].index("-n") + 1] for job in jobs}) == len(jobs)
+    assert len({(job["scan_id"], index) for job in jobs for index in job["point_indices"]}) == 26 * 2 * 5
+    assert all(job["point_indices"] == list(range(5)) for job in jobs)
+    job = plan["plan"]["jobs"][0]
+    assert "--firstPoint" not in job["argv"] and "--lastPoint" not in job["argv"]
+    assert job["point_indices"] == list(range(5))
     actual = invoke("plan", campaign_id, "--backend", "condor", backend_map=None)
     assert "not qualified" in invoke("dispatch", campaign_id, actual["request"]["attempt_id"], backend_map=None, expected=2)["error"]
     assert all(p["status"] == "planned" for p in invoke("status", campaign_id, backend_map={})["points"])
@@ -233,4 +273,5 @@ def test_identity_owned_content_and_corruption_are_per_scan(campaign_inputs, pro
     assert {p["status"] for p in observed["points"] if p["wc"] == "c_one"} == {"missing"}
     assert {p["status"] for p in observed["points"] if p["wc"] == "c_two"} == {"accepted"}
     retry = invoke("retry", campaign_id, "--backend", "provider_b", "--dry-run")
-    assert {p["wc"] for p in retry["request"]["points"]} == {"c_one"}
+    assert retry["status"] == "no_eligible_points"
+    assert {p["reason"] for p in retry["not_yet_recoverable"] if p["scan_id"] == "c_one:profiled"} == {"canonical_reference_damaged"}

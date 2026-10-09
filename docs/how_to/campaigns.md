@@ -78,8 +78,13 @@ guard against a stale restart decision. `clone` creates an independent ID and
 physical namespace with an identical spec digest and a parent-ID reference;
 no execution/results are shared. There is no destructive restart or cleanup.
 
-`plan`, `retry`, and `rescue` select points automatically, excluding accepted
-canonical points and dispatch intents awaiting collection. `--scan-id WC:mode`
+`plan` selects points without dispatched or collected execution. `retry` requires
+a collected terminal missing, invalid, or incomplete scientific result. `rescue`
+requires a collected numerical grid failure (`deltaNLL=9990`) and its explicit
+strategy. Accepted points, promotion-only quarantine, and dispatch intents
+awaiting collection are excluded. A plan-only attempt is not recovery evidence.
+When none qualify, the command returns `no_eligible_points` with point-specific
+reasons and creates no attempt. `--scan-id WC:mode`
 can bound the logical scan; there is no user point-index retry selector. Retry
 preserves the numerical contract. Rescue requires the explicit
 `minimizer_strategy_1` strategy, changing only
@@ -100,11 +105,14 @@ execution links; provider names are not part of campaign or point identity.
 Without `--dry-run`, planning records an immutable planned attempt. It does not
 dispatch it. Plans contain argv arrays and predicted 009A links; these are not
 receipts proving that execution occurred. The Condor mapping uses the maintained
-configured argv and 009A digest functions. One contiguous selected index range
-forms a job basis. Recovery retains `--points N` and original
-`--firstPoint i --lastPoint j`; singleton recovery has `i == j`. Fully qualified
-execution still requires testing this mapping against generated scheduler
-members and separately authorized submission.
+configured argv and 009A digest functions. CombineTool owns the grid partition:
+a complete scan uses original `--points N` and `--split-points N`, producing one
+member covering indices `0..N-1` with one resolved first/last pair. Partial
+Condor plans fail closed: the current 009A producer schema requires split
+members for the entire original grid, so it cannot truthfully describe a sparse
+or nonzero recovery subset. Other campaign state functions and synthetic
+provider recovery remain usable. Real execution and target storage remain
+separately unqualified.
 
 `dispatch CAMPAIGN_ID ATTEMPT_ID` and `collect CAMPAIGN_ID ATTEMPT_ID` expose
 the separate provider stages for integration tests and future qualified
@@ -183,7 +191,7 @@ tests or merely storing source files on NFS.
 ## Qualification boundary
 
 Implemented: single YAML, frozen provenance, all six lifecycle operations,
-no-submit Condor mapping, mixed-provider identity via two synthetic doubles,
+full-grid no-submit Condor mapping, mixed-provider identity via two synthetic doubles,
 local crash/concurrency guards, ROOT-backed validation, isolated quarantine,
 and read-only dry runs.
 
