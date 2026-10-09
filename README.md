@@ -10,6 +10,11 @@ the [configured 1D workflow](docs/how_to/run_configured_1d.md).
 
 ## Current status
 
+- The [campaign frontend](docs/how_to/campaigns.md) provides one YAML and
+  persistent create/status/retry/rescue/restart/clone lifecycle operations.
+  Condor campaign support is no-submit planning only; mixed-provider lifecycle
+  and scientific recovery gates are tested with synthetic providers. Real
+  campaign dispatch and cross-attempt NLL promotion remain unqualified.
 - Configured profiled and frozen 1D scans are implemented. They require an
   analysis-supplied workspace and fit configuration.
 - Maintained 1D Condor execution, bounded recovery, identity-bearing results,
