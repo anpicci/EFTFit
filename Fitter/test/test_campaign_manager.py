@@ -380,7 +380,7 @@ def test_condor_path_limit_does_not_poison_local_or_status(campaign_inputs):
     ({"wc_ranges": {"c_one": [-9, 9]}}, "expected fields"),
     ({"fit_start_values": {"c_one": 1}}, "nonzero"),
     ({"keep_failures": True}, "keepFailures"),
-    ({"dataset": {"mode": "asimov", "name": "toy"}}, "Asimov"),
+    ({"dataset": {"mode": "asimov", "name": "toy"}}, "dataset.mode"),
     ({"selection": {"wcs": [], "modes": ["profiled"]}}, "nonempty"),
 ])
 def test_spec_rejections_are_local(campaign_inputs, change, match):
@@ -402,6 +402,99 @@ def test_duplicate_yaml_and_frozen_nonaxis_starts(campaign_inputs):
     source.write_text(yaml.safe_dump(data))
     with pytest.raises(ValueError, match="fixed by this scan"):
         load_spec(source)
+
+
+@pytest.mark.parametrize("mode,label", [
+    ("expected", "blinded"), ("expected", "unblinded"),
+    ("observed", "blinded"), ("observed", "unblinded"),
+])
+def test_fit_dataset_mode_is_independent_of_producer_label(campaign_inputs, mode, label,
+                                                           record_property):
+    source, data, root = campaign_inputs
+    dataset = ({"mode": "expected", "truth": "sm", "producer_label": label}
+               if mode == "expected" else
+               {"mode": "observed", "name": "data_obs", "producer_label": label})
+    data["dataset"] = dataset
+    source.write_text(yaml.safe_dump(data))
+    created = manager.create(root, source)
+    planned = manager.plan(root, created["campaign_id"], backend="local", dry_run=True)
+    argv = planned["plan"]["jobs"][0]["command_argvs"][0]
+    assert (argv.count("-t") == 1) == (mode == "expected")
+    if mode == "expected":
+        assert argv[argv.index("-t") + 1] == "-1"
+        assert "--dataset" not in argv
+    else:
+        assert argv[argv.index("--dataset") + 1] == "data_obs"
+    assignments = argv[argv.index("--setParameters") + 1].split(",")
+    assert assignments == ["c_one=0", "c_two=0", "c_fixed=0"]
+    assert "--toysFrequentist" not in argv and "--snapshotName" not in argv
+    assert planned["plan"]["jobs"][0]["execution_provenance"]["selected_indices"] == list(range(5))
+    record_property("dataset_case", json.dumps({"mode": mode, "producer_label": label,
+        "argv": argv, "spec_digest": created["spec_digest"]}, sort_keys=True))
+
+
+def test_observed_default_name_freezes_without_changing_explicit_legacy_shape(campaign_inputs):
+    source, data, _ = campaign_inputs
+    explicit, _ = load_spec(source)
+    data["dataset"] = {"mode": "observed"}
+    source.write_text(yaml.safe_dump(data))
+    defaulted, _ = load_spec(source)
+    assert defaulted == explicit
+    assert defaulted["dataset"] == {"mode": "observed", "name": "data_obs"}
+
+
+@pytest.mark.parametrize("indices,intervals", [
+    ([0, 1, 2, 3, 4], [(0, 4)]), ([0], [(0, 0)]), ([1], [(1, 1)]),
+    ([4], [(4, 4)]), ([0, 1], [(0, 1)]), ([3], [(3, 3)]),
+    ([1, 2, 3], [(1, 3)]), ([1, 3], [(1, 1), (3, 3)]),
+])
+def test_yaml_original_index_subset_reaches_both_providers(campaign_inputs, indices,
+                                                              intervals, record_property):
+    source, data, root = campaign_inputs
+    data["grid"]["selected_indices"] = list(reversed(indices))
+    source.write_text(yaml.safe_dump(data))
+    created = manager.create(root, source)
+    assert len(manager.status(root, created["campaign_id"])["points"]) == 5
+    local = manager.plan(root, created["campaign_id"], backend="local", dry_run=True)
+    condor = manager.plan(root, created["campaign_id"], backend="condor", dry_run=True)
+    assert [p["point_index"] for p in local["request"]["points"]] == indices
+    assert local["plan"]["jobs"][0]["execution_provenance"] == condor["plan"]["jobs"][0]["execution_provenance"]
+    job = condor["plan"]["jobs"][0]
+    manifest = job["execution_provenance"]
+    assert manifest["original_points"] == 5 and manifest["selected_indices"] == indices
+    assert [(member["first_point"], member["last_point"])
+            for member in manifest["expected_members"]] == intervals
+    assert len(job["condor"]["queue"]) == len(intervals)
+    assert len(manager.status(root, created["campaign_id"])["attempts"]) == 0
+    record_property("subset_case", json.dumps({"indices": indices, "intervals": intervals,
+        "job_set_id": job["job_set_id"], "command_argvs": job["command_argvs"],
+        "members": manifest["expected_members"], "queue": job["condor"]["queue"]}, sort_keys=True))
+
+
+@pytest.mark.parametrize("dataset,match", [
+    ({"mode": "expected", "truth": "bsm"}, "only sm"),
+    ({"mode": "expected", "truth": "sm", "nuisance_generation": "frequentist"}, "unqualified"),
+    ({"mode": "expected", "truth": "sm", "snapshot_name": "prefit"}, "expected fields"),
+    ({"mode": "expected", "truth": "sm", "bypass_frequentist_fit": True}, "expected fields"),
+    ({"mode": "expected"}, "expected fields"),
+])
+def test_unqualified_expected_policy_fails_before_campaign(campaign_inputs, dataset, match):
+    source, data, root = campaign_inputs
+    data["dataset"] = dataset
+    source.write_text(yaml.safe_dump(data))
+    with pytest.raises(ValueError, match=match):
+        manager.create(root, source)
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("indices", [[], [0, 0], [5], [-1], [True], [1.0], "1,3"])
+def test_invalid_yaml_subset_fails_before_campaign(campaign_inputs, indices):
+    source, data, root = campaign_inputs
+    data["grid"]["selected_indices"] = indices
+    source.write_text(yaml.safe_dump(data))
+    with pytest.raises(ValueError, match="selected grid"):
+        manager.create(root, source)
+    assert not root.exists()
 
 
 def test_grid_coordinates_must_remain_distinguishable(campaign_inputs):

@@ -233,6 +233,9 @@ def plan(root, campaign_id, operation="plan", backend=None, strategy=None, dry_r
             raise ValueError("unknown logical scan_id")
         active, _, attempts, receipts = current_state(snapshot)
         scoped = [p for p in observed["points"] if scan_id is None or p["scan_id"] == scan_id]
+        selected_indices = spec["grid"].get("selected_indices")
+        if selected_indices is not None:
+            scoped = [p for p in scoped if p["point_index"] in selected_indices]
         selected, deferred = planning_eligibility(operation, scoped, attempts, receipts,
                                                   active["generation_id"])
         points = [{key: p[key] for key in ("scan_id", "wc", "mode", "point_index", "coordinate")} for p in selected]

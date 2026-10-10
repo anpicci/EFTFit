@@ -8,7 +8,8 @@ import re
 
 import yaml
 
-from .execution_provenance import canonical_json_bytes, file_identity, workspace_identity
+from .execution_provenance import (canonical_json_bytes, file_identity, workspace_identity,
+                                   normalize_grid_indices)
 from .inference_recipe import normalize_inference_recipe, bind_inference_invocation
 from .wc_fit_config import load_fit_input_package, load_fit_config, resolve_scan_wcs, WCFitConfig
 
@@ -64,11 +65,24 @@ def load_spec(path):
     for label, observed in (("package", package_identity), ("workspace", workspace)):
         if data[label]["sha256"] != observed["sha256"]:
             raise ValueError(label + " sha256 mismatch")
-    fields(data["dataset"], {"mode", "name"})
-    if data["dataset"]["mode"] != "observed":
-        raise ValueError("Asimov execution is unqualified: explicit truth/dataset generation provenance needs qualification")
-    if not isinstance(data["dataset"]["name"], str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", data["dataset"]["name"]):
-        raise ValueError("dataset.name must explicitly name an observed workspace dataset")
+    dataset = data["dataset"]
+    if not isinstance(dataset, dict) or dataset.get("mode") not in ("observed", "expected"):
+        raise ValueError("dataset.mode must be observed or expected")
+    if dataset["mode"] == "observed":
+        fields(dataset, {"mode"}, {"name", "producer_label"})
+        name = dataset.get("name", "data_obs")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError("dataset.name must name a workspace dataset")
+        effective_dataset = dict(dataset, name=name)
+    else:
+        fields(dataset, {"mode", "truth"}, {"nuisance_generation", "producer_label"})
+        if dataset["truth"] != "sm":
+            raise ValueError("expected generation truth currently supports only sm")
+        if dataset.get("nuisance_generation", "nominal") != "nominal":
+            raise ValueError("frequentist nuisance generation requires verified source data and is unqualified")
+        effective_dataset = dict(dataset, nuisance_generation="nominal")
+    if "producer_label" in dataset and dataset["producer_label"] not in ("blinded", "unblinded"):
+        raise ValueError("dataset.producer_label must be blinded or unblinded")
     fields(data["selection"], {"wcs", "modes"})
     wcs = data["selection"]["wcs"]
     if wcs == "all_scientific":
@@ -79,14 +93,19 @@ def load_spec(path):
     modes = data["selection"]["modes"]
     if not isinstance(modes, list) or not modes or any(mode not in ("profiled", "frozen") for mode in modes) or len(modes) != len(set(modes)):
         raise ValueError("selection.modes must be a nonempty unique list of profiled/frozen")
-    fields(data["grid"], {"points", "align_edges"})
+    fields(data["grid"], {"points", "align_edges"}, {"selected_indices"})
     count = data["grid"]["points"]
     if type(count) is not int or count < 2 or type(data["grid"]["align_edges"]) is not bool:
         raise ValueError("grid requires explicit integer points >= 2 and boolean align_edges")
+    effective_grid = dict(data["grid"])
+    if "selected_indices" in effective_grid:
+        effective_grid["selected_indices"], _ = normalize_grid_indices(
+            count, effective_grid["selected_indices"])
     starts = data.get("fit_start_values", {})
     for mode in modes:
         recipe = normalize_inference_recipe({"schema_version": 1, "family": "scan_1d_" + mode,
-                                             "dataset_mode": "observed", "fit_start_values": starts}, config)
+                                             "dataset_mode": "observed" if dataset["mode"] == "observed" else "asimov",
+                                             "fit_start_values": starts}, config)
         for wc in wcs:
             bind_inference_invocation(recipe, config, axes=(wc,))
     if any(value != 0 for value in starts.values()):
@@ -95,8 +114,8 @@ def load_spec(path):
     if backend is not None and (not isinstance(backend, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", backend)):
         raise ValueError("backend must be a provider name")
     effective = {"schema_version": 1, "package": package_identity, "workspace": workspace,
-                 "dataset": data["dataset"], "selection": {"wcs": wcs, "modes": modes},
-                 "grid": data["grid"], "fit_start_values": starts, "default_backend": backend,
+                 "dataset": effective_dataset, "selection": {"wcs": wcs, "modes": modes},
+                 "grid": effective_grid, "fit_start_values": starts, "default_backend": backend,
                  "keep_failures": False,
                  "fit_config": {"analysis": config.analysis, "scientific_wcs": config.scientific_wcs,
                                 "fixed_wcs": config.fixed_wcs, "wc_ranges": config.wc_ranges}}

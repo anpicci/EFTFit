@@ -19,13 +19,14 @@ workspace:
   sha256: <sha256 of workspace.root>
 dataset:
   mode: observed
-  name: data_obs  # explicit workspace dataset name, checked before real execution
+  name: data_obs  # named workspace dataset; contents need separate lineage evidence
 selection:
   wcs: all_scientific  # or a nonempty list from the package
   modes: [profiled, frozen]
 grid:
   points: 5           # synthetic illustration, NOT a production recommendation
   align_edges: true  # explicit; false selects bin centers
+  selected_indices: [1, 3]  # optional original-grid work request
 backend: condor       # optional default for new execution plans
 keep_failures: false
 ```
@@ -38,6 +39,38 @@ workspace. The observed dataset name is a workspace object name; external
 additional identity contract. Dataset presence and workspace scientific
 qualification remain prerequisites to future real execution.
 
+For runtime Asimov generation, use `dataset: {mode: expected, truth: sm}`.
+The frozen effective spec records `nuisance_generation: nominal`; the plan
+emits `-t -1` and the package-authoritative 26 scientific plus 10 fixed-zero
+WC assignments through `--setParameters`. This single command uses that zero
+state for generation and the initial fit. A different generation truth or a
+fit start distinct from it is rejected before campaign creation. The nominal
+expected path does not inject a workspace dataset name. Either fit-side mode
+may accompany blinded or unblinded producer cards. `observed` emits
+`--dataset <name>` and no toy flag; omitted `name` defaults to `data_obs` in
+the frozen spec. The name does not claim real events. In
+the accepted 016B workspace, `data_obs` has separately proven prebuilt SM
+Asimov source lineage. Optional `dataset.producer_label: blinded | unblinded`
+records the YAML author's card provenance label in the frozen spec without
+changing the fit-side mode or certifying that label.
+
+At `CombinedLimit@6a5a27ec49d677e93833aec13d76cd8bea3e0050`,
+frequentist nuisance conditioning, `--bypassFrequentistFit`, and
+`--snapshotName` remain unavailable in this frontend. Pinned Combine source
+shows that the frequentist Asimov path consumes a named input dataset even
+when the fit is bypassed, while a snapshot loads workspace state before WC
+assignments. The current planner cannot verify the required dataset or
+snapshot object and contents. Such options fail schema validation instead of
+silently falling back to nominal generation. No generated Asimov result is
+claimed equivalent to a prebuilt card observation.
+
+`grid.selected_indices` is an optional nonempty unique list of original
+indices from `0` through `points - 1`. The effective spec sorts it; local and
+Condor plans use exactly those indices while retaining original `points`,
+coordinates, and the complete campaign scan domain. `retry` and `rescue`
+derive eligible work automatically from attempts and receipts within that
+frozen request. A partial request does not change the physical grid.
+
 The package owns scientific/fixed-zero WC populations and scientific ranges.
 For TOP-26-006 these are the accepted 26/10 populations. The frontend does not
 require recipe, starts, reference, dataset or family fields in the package.
@@ -46,8 +79,8 @@ second recipe YAML, or unknown fields are accepted. `InferenceRecipe` validates
 the selected family/axis internally. Optional `fit_start_values` may contain
 zero values allowed by that family. Nonzero starts are rejected because the
 configured argv builder does not support them. A frozen scan rejects starts
-for non-axis WCs. Unsupported Asimov truth/generation semantics block only that
-new specification; observed campaigns and existing inspection remain usable.
+for non-axis WCs. Unsupported generation or conditioning semantics block only
+that new specification; existing campaign inspection remains usable.
 
 Creation freezes the effective configuration and its digest, package/workspace
 identities, and original YAML text. Later source YAML edits do not change it.
@@ -203,6 +236,26 @@ those capabilities and deployment permissions on the target storage before
 multi-host execution. No shared-filesystem production claim follows from local
 tests or merely storing source files on NFS.
 
+## Legacy practice delta
+
+Compared with local `py3Combine@e312d533e897c6b5cad4cc54a4b3c5f9f5d54827`;
+this is a source comparison, not a claim of full legacy parity. The relation
+to the historical public `203dec4870f0075793c5255e53f0724463a5f54c`
+reference is unqualified. Legacy choices are a comparison baseline, not the
+scientific authority for the new 1D campaign.
+
+| Source locus | Legacy executable behavior | Current 1D campaign | Class and reason | Qualification |
+| --- | --- | --- | --- | --- |
+| `Fitter/scripts/EFTFitter.py:440-484` at `py3Combine` | `combineTool.py` grid with conditional Condor splitting | Direct `combine` uses original-index ranges and 009A member names | Intentional difference: immutable member ownership | Source compared; no fit run |
+| `Fitter/scripts/EFTFitter.py:455-457` at `py3Combine` | Zero starts for scan/tracked WCs unless overridden | Package population sets all scientific and fixed WCs to zero | Intentional difference: explicit SM generation state | Nominal command plan only |
+| `Fitter/scripts/EFTFitter.py:1503,1592` at `py3Combine` | Generated impacts scripts append `-t -1` on their blinded path | Fit-side `expected` adds `-t -1` independently of producer label | Intentional difference: separate dataset layers | Legacy impacts path only; no 1D parity claim |
+| `Fitter/python/CombineHelper.py:764` and `Fitter/scripts/combine_helper.py:675` at `py3Combine` | Saturated GoF helper adds `--toysFrequentist`; bypass is only a commented example | 1D frequentist conditioning is unsupported | Legacy only: different family and unverified input data | Requires separate qualification |
+| `Fitter/scripts/EFTFitter.py:440-484` at `py3Combine` | No active snapshot flag in inspected grid path | Named snapshot is unsupported | Not yet qualified: workspace snapshot contents are unverified | Inspected path only |
+| `Fitter/scripts/EFTFitter.py:484` at `py3Combine` | CombineTool output names | Job digest and `POINTS.i.j` member ownership | Intentional difference: receipt and collision control | Source compared |
+
+Of these six inspected rows, four are intentional differences, one is legacy
+only, and one remains unqualified. These counts describe the rows above only.
+
 ## Qualification boundary
 
 Implemented: single YAML, frozen provenance, all six lifecycle operations,
@@ -213,7 +266,7 @@ local crash/concurrency guards, ROOT-backed validation, isolated quarantine,
 and read-only dry runs.
 
 Not yet production-qualified: real campaign provider dispatch/collection,
-cross-attempt/member NLL anchors, Asimov truth, keepFailures initial-fit semantics,
+cross-attempt/member NLL anchors, runtime Asimov truth, keepFailures initial-fit semantics,
 production storage, interval/grid precision and coverage, final scientific
 workspace authority, configured 2D and impacts presets. These are separate
 extensions or scientific gates; they do not disable existing lifecycle/status

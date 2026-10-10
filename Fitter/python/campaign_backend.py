@@ -22,9 +22,16 @@ def runtime_identity():
 
 
 def grid_argv(spec, point, strategy):
+    dataset = spec["dataset"]
+    if dataset["mode"] == "observed":
+        dataset_options = ["--dataset", dataset["name"]]
+    elif dataset["mode"] == "expected" and dataset["truth"] == "sm" and dataset["nuisance_generation"] == "nominal":
+        dataset_options = ["-t", "-1"]
+    else:
+        raise ValueError("unsupported or unfrozen campaign dataset policy")
     args = build_configured_grid_scan_command(fit_config(spec), spec["workspace"]["resolved_path"],
         name="", freeze=point["mode"] == "frozen", scan_params=[point["wc"]],
-        points=spec["grid"]["points"], other=["--dataset", spec["dataset"]["name"],
+        points=spec["grid"]["points"], other=dataset_options + [
         "--alignEdges", "1" if spec["grid"]["align_edges"] else "0"])
     args[0] = "combine"
     if strategy == "minimizer_strategy_1":
