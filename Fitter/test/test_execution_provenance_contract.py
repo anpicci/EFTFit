@@ -9,6 +9,13 @@ import types
 
 import pytest
 
+from python.execution_provenance import (
+    build_direct_attempt_record, build_direct_grid_provenance,
+    build_final_provenance, final_provenance_path, resolve_canonical_aggregate,
+    sha256_file, validate_direct_attempt_record, validate_direct_grid_provenance,
+    workspace_identity, write_json_exclusive,
+)
+
 
 FITTER_DIR = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = FITTER_DIR / "scripts" / "EFTFitter.py"
@@ -251,10 +258,15 @@ def test_initial_submission_binds_workspace_bytes_and_records_attempt(
     command = next(call for call in recorder.popen_calls if call[0] == "combineTool.py")
     directories = list(Path(".").glob("condor.provenance.c_one.job_*"))
     assert len(directories) == 1
+    manifest_path = directories[0] / "execution_provenance.json"
+    attempt_path = directories[0] / "attempts" / "attempt_0001.json"
+    original_manifest_bytes = manifest_path.read_bytes()
+    original_attempt_bytes = attempt_path.read_bytes()
     provenance = json.loads(
-        (directories[0] / "execution_provenance.json").read_text(encoding="utf-8")
+        manifest_path.read_text(encoding="utf-8")
     )
     assert eftfitter._validate_condor_provenance(provenance, ".provenance.c_one")
+    assert eftfitter._load_condor_provenance(".provenance.c_one", provenance["job_set_id"]) == provenance
     assert len(provenance["job_set_id"]) == 64
     assert provenance["workspace_identity"]["sha256"] == eftfitter.sha256_file(workspace)
     assert eftfitter._semantic_argv(command) == provenance["runtime_semantic_argv"]
@@ -263,13 +275,13 @@ def test_initial_submission_binds_workspace_bytes_and_records_attempt(
         == provenance["identity_semantic_argv"]
     )
     attempt = json.loads(
-        (directories[0] / "attempts" / "attempt_0001.json").read_text(
-            encoding="utf-8"
-        )
+        attempt_path.read_text(encoding="utf-8")
     )
     assert attempt["job_set_id"] == provenance["job_set_id"]
     assert attempt["reason"] == "initial_submission"
     assert attempt["member_set"] == provenance["expected_members"]
+    assert manifest_path.read_bytes() == original_manifest_bytes
+    assert attempt_path.read_bytes() == original_attempt_bytes
 
 
 def test_same_path_changed_bytes_changes_job_identity_and_stales_record(
@@ -470,6 +482,77 @@ def test_duplicate_successful_member_identity_fails_closed(
     os.link(paths[0], paths[1])
     with pytest.raises(RuntimeError, match="duplicate files"):
         eftfitter._inspect_condor_members(provenance)
+
+
+def test_direct_grid_009a_attempt_members_and_resolver(eftfitter, tmp_path, monkeypatch):
+    workspace, fit_directory = prepare_directory(tmp_path, monkeypatch)
+    base = ["combine", "-d", str(workspace), "-M", "MultiDimFit", "--algo", "grid",
+            "--points", "5", "--alignEdges", "1"]
+    provenance = build_direct_grid_provenance(
+        ".direct.c_one", base, workspace_identity(workspace), 5, [3, 1],
+        Path.cwd() / "execution")
+    assert validate_direct_grid_provenance(provenance) == provenance
+    assert [member["first_point"] for member in provenance["expected_members"]] == [1, 3]
+    changed_selection = build_direct_grid_provenance(
+        provenance["scan_name"], base, workspace_identity(workspace), 5, [1],
+        provenance["execution_root"])
+    assert changed_selection["job_set_id"] != provenance["job_set_id"]
+    with pytest.raises(ValueError, match="duplicate"):
+        build_direct_grid_provenance(provenance["scan_name"], base,
+            workspace_identity(workspace), 5, [1, 1], provenance["execution_root"])
+    with pytest.raises(ValueError, match="unsupported"):
+        build_direct_grid_provenance(provenance["scan_name"], base + ["--gridPoints=5"],
+            workspace_identity(workspace), 5, [1], provenance["execution_root"])
+    manifest_path = Path(eftfitter._write_condor_provenance(provenance))
+    original_bytes = manifest_path.read_bytes()
+    assert eftfitter._load_condor_provenance(provenance["scan_name"], provenance["job_set_id"],
+                                            provenance["execution_root"]) == provenance
+    with pytest.raises(RuntimeError, match="not qualified"):
+        make_fitter(eftfitter).retrieveGridScan(provenance["scan_name"], "condor",
+            require_condor_provenance=True, job_set_id=provenance["job_set_id"],
+            execution_root=provenance["execution_root"])
+    assert manifest_path.read_bytes() == original_bytes
+    attempt = build_direct_attempt_record(provenance, "campaign_" + "a" * 32,
+        "synthetic_no_submit", provenance["expected_members"], manifest_path, [])
+    attempt_path = Path(provenance["attempts_directory"]) / (attempt["attempt_id"] + ".json")
+    write_json_exclusive(attempt_path, attempt)
+    assert eftfitter._validate_attempt_record(provenance, attempt_path, sha256_file(manifest_path)) == attempt
+    assert len(eftfitter._attempt_history_references(provenance)) == 1
+    with pytest.raises(RuntimeError, match="already exists"):
+        write_json_exclusive(attempt_path, attempt)
+    duplicate = dict(attempt, member_set=[provenance["expected_members"][0]] * 2)
+    with pytest.raises(RuntimeError, match="duplicate"):
+        validate_direct_attempt_record(provenance, duplicate, sha256_file(manifest_path))
+    foreign = dict(attempt, member_set=[dict(provenance["expected_members"][0], first_point=0)])
+    with pytest.raises(RuntimeError, match="foreign"):
+        validate_direct_attempt_record(provenance, foreign, sha256_file(manifest_path))
+    valid, missing = eftfitter._inspect_condor_members(provenance)
+    assert valid == [] and missing == provenance["expected_members"]
+    paths = [Path(provenance["execution_directory"]) / member["file_name"]
+             for member in provenance["expected_members"]]
+    paths[0].write_bytes(b"synthetic member one")
+    assert len(eftfitter._inspect_condor_members(provenance)[1]) == 1
+    unexpected = paths[0].with_name(paths[0].name.replace(".POINTS.1.1", ".POINTS.2.2"))
+    unexpected.write_bytes(b"unexpected")
+    with pytest.raises(RuntimeError, match="unexpected"):
+        eftfitter._inspect_condor_members(provenance)
+    unexpected.unlink()
+    os.link(paths[0], paths[1])
+    with pytest.raises(RuntimeError, match="duplicate files"):
+        eftfitter._inspect_condor_members(provenance)
+    paths[1].unlink()
+    paths[1].write_bytes(b"synthetic member two")
+    assert eftfitter._inspect_condor_members(provenance)[1] == []
+    aggregate = Path(provenance["aggregate_output"])
+    aggregate.parent.mkdir(parents=True)
+    aggregate.write_bytes(b"synthetic aggregate; no fit")
+    final = build_final_provenance(provenance, aggregate,
+                                   eftfitter._attempt_history_references(provenance),
+                                   "synthetic_only")
+    write_json_exclusive(final_provenance_path(aggregate), final)
+    assert resolve_canonical_aggregate(provenance["scan_name"], provenance["job_set_id"],
+                                       aggregate.parent) == str(aggregate.resolve())
+    assert fit_directory.exists()
 
 
 def test_retrieval_requires_complete_members(eftfitter, tmp_path, monkeypatch):

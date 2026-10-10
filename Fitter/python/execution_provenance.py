@@ -122,9 +122,31 @@ def identity_semantic_argv(runtime_semantic_argv):
     return identity_semantic
 
 
-def job_set_identity_basis(batch, scan_name, identity_semantic_argv, workspace_sha256):
+def normalize_grid_indices(original_points, selected_indices):
+    """Return exact original-grid membership and its maximal contiguous ranges."""
+    if type(original_points) is not int or original_points < 2:
+        raise ValueError("original grid size must be an integer >= 2")
+    if not isinstance(selected_indices, (list, tuple)) or not selected_indices:
+        raise ValueError("selected grid indices must be nonempty")
+    if any(type(index) is not int or index < 0 or index >= original_points
+           for index in selected_indices):
+        raise ValueError("selected grid index is outside the original grid")
+    if len(set(selected_indices)) != len(selected_indices):
+        raise ValueError("duplicate selected grid index")
+    indices = sorted(selected_indices)
+    intervals = []
+    for index in indices:
+        if not intervals or index != intervals[-1][1] + 1:
+            intervals.append([index, index])
+        else:
+            intervals[-1][1] = index
+    return indices, intervals
+
+
+def job_set_identity_basis(batch, scan_name, identity_semantic_argv, workspace_sha256,
+                           original_points=None, selected_indices=None):
     """Build the portable logical job identity basis."""
-    if batch != "condor":
+    if batch not in ("condor", "direct_grid"):
         raise RuntimeError("Job identity batch is not supported")
     validate_scan_name(scan_name)
     if not isinstance(identity_semantic_argv, list) or not all(
@@ -135,23 +157,167 @@ def job_set_identity_basis(batch, scan_name, identity_semantic_argv, workspace_s
         workspace_sha256
     ):
         raise RuntimeError("workspace_sha256 is invalid")
-    return {
+    basis = {
         "batch": batch,
         "scan_name": scan_name,
         "identity_semantic_argv": identity_semantic_argv,
         "workspace_sha256": workspace_sha256,
     }
+    if batch == "direct_grid":
+        indices, _ = normalize_grid_indices(original_points, selected_indices)
+        basis.update(original_points=original_points, selected_indices=indices)
+    elif original_points is not None or selected_indices is not None:
+        raise RuntimeError("Legacy Condor identity cannot take selected indices")
+    return basis
 
 
-def compute_job_set_id(batch, scan_name, identity_semantic_argv, workspace_sha256):
+def compute_job_set_id(batch, scan_name, identity_semantic_argv, workspace_sha256,
+                       original_points=None, selected_indices=None):
     """Return the SHA-256 identifier for one portable logical job basis."""
     basis = job_set_identity_basis(
         batch,
         scan_name,
         identity_semantic_argv,
         workspace_sha256,
+        original_points,
+        selected_indices,
     )
     return hashlib.sha256(canonical_json_bytes(basis)).hexdigest()
+
+
+def _single_option(argv, option):
+    if argv.count(option) != 1:
+        raise ValueError("{} must occur exactly once".format(option))
+    index = argv.index(option)
+    if index + 1 >= len(argv):
+        raise ValueError("{} requires a value".format(option))
+    return argv[index + 1]
+
+
+def build_direct_grid_provenance(scan_name, base_argv, recorded_workspace_identity,
+                                 original_points, selected_indices, execution_root):
+    """Build one provider-neutral 009A member contract; perform no I/O."""
+    validate_scan_name(scan_name)
+    indices, intervals = normalize_grid_indices(original_points, selected_indices)
+    if not isinstance(base_argv, list) or not all(isinstance(arg, str) for arg in base_argv):
+        raise ValueError("direct grid argv must be a list of strings")
+    if not base_argv or base_argv[0] != "combine":
+        raise ValueError("direct grid command must invoke combine")
+    unsupported = ("--gridPoints", "--firstPoint", "--lastPoint", "--split-points",
+                   "--job-mode", "--dry-run", "--keepFailures", "-n", "--task-name")
+    if any(arg == option or arg.startswith(option + "=")
+           for arg in base_argv for option in unsupported):
+        raise ValueError("direct grid base argv contains an unsupported or member-specific option")
+    if _single_option(base_argv, "--points") != str(original_points):
+        raise ValueError("direct grid command changed the original point count")
+    if _single_option(base_argv, "-M") != "MultiDimFit" or _single_option(base_argv, "--algo") != "grid":
+        raise ValueError("direct grid command requires MultiDimFit grid")
+    if os.path.realpath(_single_option(base_argv, "-d")) != recorded_workspace_identity["resolved_path"]:
+        raise ValueError("direct grid workspace locator differs from recorded workspace")
+    _validate_workspace_identity_structure(recorded_workspace_identity)
+    identity_argv = identity_semantic_argv(base_argv)
+    identity_basis = job_set_identity_basis("direct_grid", scan_name, identity_argv,
+        recorded_workspace_identity["sha256"], original_points, indices)
+    job_set_id = compute_job_set_id("direct_grid", scan_name, identity_argv,
+                                   recorded_workspace_identity["sha256"], original_points, indices)
+    output_label = "{}.job_{}".format(scan_name, job_set_id)
+    root = os.path.abspath(os.fspath(execution_root))
+    execution_directory = os.path.join(root, "direct{}.job_{}".format(scan_name, job_set_id))
+    members = []
+    commands = []
+    for member_index, (first, last) in enumerate(intervals):
+        label = "{}.POINTS.{}.{}".format(output_label, first, last)
+        members.append({"member_index": member_index, "first_point": first,
+                        "last_point": last,
+                        "file_name": "higgsCombine{}.MultiDimFit.mH120.root".format(label)})
+        commands.append(base_argv + ["--firstPoint", str(first), "--lastPoint", str(last),
+                                     "-n", label])
+    aggregate = canonical_aggregate_path(scan_name, job_set_id,
+        os.path.join(root, "fit_files"))
+    return {"schema": 4, "batch": "direct_grid", "scan_name": scan_name,
+            "job_set_id": job_set_id, "workspace_identity": recorded_workspace_identity,
+            "runtime_semantic_argv": list(base_argv), "identity_semantic_argv": identity_argv,
+            "identity_basis": identity_basis, "original_points": original_points,
+            "selected_indices": indices, "output_label": output_label,
+            "expected_members": members, "command_argvs": commands,
+            "execution_root": root, "execution_directory": execution_directory,
+            "attempts_directory": os.path.join(execution_directory, "attempts"),
+            "scheduler_directory": os.path.join(execution_directory, "scheduler"),
+            "aggregate_output": aggregate,
+            "final_provenance": final_provenance_path(aggregate)}
+
+
+def validate_direct_grid_provenance(provenance, expected_scan_name=None):
+    """Regenerate every schema-4 identity, member, command and path."""
+    if not isinstance(provenance, dict) or provenance.get("schema") != 4:
+        raise RuntimeError("Direct grid provenance schema is not supported")
+    if expected_scan_name is not None and provenance.get("scan_name") != expected_scan_name:
+        raise RuntimeError("Direct grid scan identity differs")
+    try:
+        expected = build_direct_grid_provenance(
+            provenance["scan_name"], provenance["runtime_semantic_argv"],
+            provenance["workspace_identity"], provenance["original_points"],
+            provenance["selected_indices"], provenance["execution_root"])
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise RuntimeError("Invalid direct grid provenance: {}".format(error)) from error
+    if provenance != expected:
+        raise RuntimeError("Direct grid provenance identity, members or commands are inconsistent")
+    return provenance
+
+
+def build_direct_attempt_record(provenance, attempt_id, reason, selected_members,
+                                manifest_path, scheduler_artifacts):
+    """Bind an attempt-local member subset to exact immutable schema-4 bytes."""
+    validate_direct_grid_provenance(provenance)
+    if not isinstance(attempt_id, str) or not re.fullmatch(r"campaign_[0-9a-f]{32}", attempt_id):
+        raise ValueError("direct-grid attempt_id is invalid")
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("direct-grid attempt reason is invalid")
+    if not isinstance(selected_members, list) or not selected_members:
+        raise ValueError("direct-grid attempt has no members")
+    expected = {canonical_json_bytes(member) for member in provenance["expected_members"]}
+    supplied = [canonical_json_bytes(member) for member in selected_members]
+    if len(supplied) != len(set(supplied)) or not set(supplied) <= expected:
+        raise ValueError("direct-grid attempt has duplicate or foreign members")
+    if not isinstance(scheduler_artifacts, list) or not all(
+            isinstance(path, str) and path for path in scheduler_artifacts):
+        raise ValueError("direct-grid scheduler artifact references are invalid")
+    return {"schema": 2, "attempt_id": attempt_id, "job_set_id": provenance["job_set_id"],
+            "reason": reason, "member_set": selected_members,
+            "created_from": {"path": os.path.realpath(os.fspath(manifest_path)),
+                             "sha256": sha256_file(manifest_path)},
+            "scheduler_artifacts": scheduler_artifacts}
+
+
+def validate_direct_attempt_record(provenance, record, manifest_sha256):
+    validate_direct_grid_provenance(provenance)
+    if not isinstance(record, dict) or set(record) != {
+            "schema", "attempt_id", "job_set_id", "reason", "member_set",
+            "created_from", "scheduler_artifacts"} or record.get("schema") != 2:
+        raise RuntimeError("Direct-grid attempt record has an unexpected schema")
+    if not isinstance(manifest_sha256, str) or not _job_set_id_pattern.fullmatch(manifest_sha256):
+        raise RuntimeError("Direct-grid manifest SHA is invalid")
+    if not isinstance(record["attempt_id"], str) or not re.fullmatch(
+            r"campaign_[0-9a-f]{32}", record["attempt_id"]):
+        raise RuntimeError("Direct-grid attempt identity is invalid")
+    if record["job_set_id"] != provenance["job_set_id"] or not isinstance(
+            record["reason"], str) or not record["reason"]:
+        raise RuntimeError("Direct-grid attempt linkage is inconsistent")
+    members = record["member_set"]
+    if not isinstance(members, list) or not members:
+        raise RuntimeError("Direct-grid attempt member_set is invalid")
+    expected = {canonical_json_bytes(member) for member in provenance["expected_members"]}
+    supplied = [canonical_json_bytes(member) for member in members]
+    if len(supplied) != len(set(supplied)) or not set(supplied) <= expected:
+        raise RuntimeError("Direct-grid attempt has duplicate or foreign members")
+    origin = record["created_from"]
+    if not isinstance(origin, dict) or set(origin) != {"path", "sha256"} or not isinstance(
+            origin["path"], str) or not origin["path"] or origin["sha256"] != manifest_sha256:
+        raise RuntimeError("Direct-grid attempt does not bind immutable manifest")
+    if not isinstance(record["scheduler_artifacts"], list) or not all(
+            isinstance(path, str) and path for path in record["scheduler_artifacts"]):
+        raise RuntimeError("Direct-grid attempt scheduler artifacts are invalid")
+    return record
 
 
 def validate_job_set_id(job_set_id):
@@ -219,6 +385,8 @@ def read_json(path):
 
 def validate_execution_identity(provenance):
     """Validate the generic immutable identity fields of execution provenance."""
+    if isinstance(provenance, dict) and provenance.get("schema") == 4:
+        return validate_direct_grid_provenance(provenance)
     required = {
         "batch",
         "scan_name",
@@ -267,7 +435,7 @@ def build_final_provenance(
     validate_execution_identity(execution_provenance)
     canonical = os.path.realpath(os.fspath(canonical_path))
     aggregate_identity = file_identity(canonical)
-    return {
+    result = {
         "schema": final_aggregate_provenance_schema,
         "batch": execution_provenance["batch"],
         "job_set_id": execution_provenance["job_set_id"],
@@ -286,6 +454,11 @@ def build_final_provenance(
         "canonical_aggregate_sha256": aggregate_identity["sha256"],
         "publication_state": publication_state,
     }
+    if execution_provenance.get("schema") == 4:
+        result.update(execution_schema=4,
+                      original_points=execution_provenance["original_points"],
+                      selected_indices=execution_provenance["selected_indices"])
+    return result
 
 
 def validate_final_provenance(provenance_path_value, expected_scan_name=None, expected_job_set_id=None):
@@ -309,6 +482,9 @@ def validate_final_provenance(provenance_path_value, expected_scan_name=None, ex
         "canonical_aggregate_sha256",
         "publication_state",
     }
+    direct_grid = isinstance(provenance, dict) and provenance.get("execution_schema") == 4
+    if direct_grid:
+        required_keys |= {"execution_schema", "original_points", "selected_indices"}
     if not isinstance(provenance, dict) or set(provenance) != required_keys:
         raise RuntimeError("Final aggregate provenance has an unexpected schema")
     if provenance["schema"] != final_aggregate_provenance_schema:
@@ -330,6 +506,8 @@ def validate_final_provenance(provenance_path_value, expected_scan_name=None, ex
         provenance["scan_name"],
         provenance["identity_semantic_argv"],
         provenance["workspace_sha256"],
+        provenance["original_points"] if direct_grid else None,
+        provenance["selected_indices"] if direct_grid else None,
     )
     if provenance["job_set_id"] != observed_job_set_id:
         raise RuntimeError("Final aggregate job_set_id is inconsistent")

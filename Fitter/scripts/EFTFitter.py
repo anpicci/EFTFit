@@ -19,6 +19,8 @@ from collections import defaultdict
 from EFTFit.Fitter.findMask import findMask
 from EFTFit.Fitter.execution_provenance import (
     build_final_provenance,
+    validate_direct_attempt_record,
+    validate_direct_grid_provenance,
     canonical_aggregate_path,
     canonical_json_bytes,
     compute_job_set_id,
@@ -180,6 +182,8 @@ def _build_condor_provenance(scan_name, argv, points, split_points):
 
 
 def _validate_condor_provenance(provenance, scan_name):
+    if isinstance(provenance, dict) and provenance.get('schema') == 4:
+        return validate_direct_grid_provenance(provenance, scan_name)
     required_keys = {
         'schema',
         'batch',
@@ -297,9 +301,14 @@ def _write_condor_provenance(provenance):
     return write_json_exclusive(path, provenance)
 
 
-def _load_condor_provenance(scan_name, job_set_id=None):
+def _load_condor_provenance(scan_name, job_set_id=None, execution_root=None):
     prefix = 'condor{}.job_'.format(scan_name)
-    if job_set_id is not None:
+    if execution_root is not None:
+        if job_set_id is None:
+            raise RuntimeError('Direct-grid provenance requires an explicit job_set_id')
+        paths = [os.path.join(execution_root, 'direct{}.job_{}'.format(
+            scan_name, job_set_id), 'execution_provenance.json')]
+    elif job_set_id is not None:
         paths = [
             os.path.join(
                 '{}{}'.format(prefix, job_set_id),
@@ -474,6 +483,8 @@ def _attempt_record_paths(provenance):
         os.path.join(directory, entry)
         for entry in os.listdir(directory)
         if re.fullmatch(r'attempt_[0-9]{4}\.json', entry)
+        or (provenance.get('schema') == 4 and
+            re.fullmatch(r'campaign_[0-9a-f]{32}\.json', entry))
     )
 
 
@@ -526,6 +537,10 @@ def _write_attempt_record(
 def _validate_attempt_record(provenance, path, expected_source_sha256):
     record = read_json(path)
     expected_attempt_id = os.path.basename(path)[:-5]
+    if provenance.get('schema') == 4:
+        if record.get('attempt_id') != expected_attempt_id:
+            raise RuntimeError('Direct-grid attempt filename differs from record')
+        return validate_direct_attempt_record(provenance, record, expected_source_sha256)
     required_keys = {
         'schema',
         'attempt_id',
@@ -1334,9 +1349,11 @@ class EFTFit(object):
         return ','.join(startValues)
 
 
-    def recoverGridScan(self, name, job_set_id=None):
+    def recoverGridScan(self, name, job_set_id=None, execution_root=None):
         """Intentionally resubmit only unresolved members of one Condor job set."""
-        provenance = _load_condor_provenance(name, job_set_id)
+        provenance = _load_condor_provenance(name, job_set_id, execution_root)
+        if provenance.get('schema') == 4:
+            raise RuntimeError('Direct-grid recovery submission is not qualified')
         _, unresolved_members = _inspect_condor_members(provenance)
         if not unresolved_members:
             logging.info('No unresolved members for %s; recovery is a no-op.', name)
@@ -1404,6 +1421,7 @@ class EFTFit(object):
         user='apiccine',
         require_condor_provenance=False,
         job_set_id=None,
+        execution_root=None,
     ):#getpass.getuser()):
         ### Retrieves finished grid jobs, extracts, and hadd's into a single file ###
         taskname = _scheduler_task_label(name)
@@ -1482,7 +1500,12 @@ class EFTFit(object):
                     os.rename('condor_{}.sub'.format(name.replace('.','')),'condor{0}/condor_{0}.sub'.format(name))
                 return
 
-            provenance = _load_condor_provenance(name, job_set_id)
+            provenance = _load_condor_provenance(name, job_set_id, execution_root)
+            if provenance.get('schema') == 4:
+                raise RuntimeError(
+                    'Direct-grid aggregation is not qualified across member '
+                    'reference NLL anchors; inspect members and receipts separately'
+                )
             execution_directory = provenance['execution_directory']
             _, unresolved_members = _inspect_condor_members(provenance)
             if unresolved_members:

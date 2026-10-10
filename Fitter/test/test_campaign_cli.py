@@ -78,7 +78,10 @@ def test_six_lifecycle_operations_mixed_backends_and_frozen_spec(campaign_inputs
     assert [p["status"] for p in observed["points"]] == ["accepted", "invalid", "accepted", "unresolved", "accepted"]
     assert first["request"]["points"][1]["point_index"] == 1
     before_condor = snapshot_tree(root)
-    assert "partial-grid planning is unqualified" in invoke("retry", campaign_id, "--backend", "condor", backend_map={"condor": condor_plan_backend()}, expected=2)["error"]
+    condor_retry = invoke("retry", campaign_id, "--backend", "condor", "--dry-run",
+                          backend_map={"condor": condor_plan_backend()})
+    assert condor_retry["plan"]["jobs"][0]["point_indices"] == [1, 3]
+    assert len(condor_retry["plan"]["jobs"][0]["condor"]["queue"]) == 2
     assert snapshot_tree(root) == before_condor
     rescue = invoke("rescue", campaign_id, "--backend", "provider_b", "--strategy", "minimizer_strategy_1", "--dry-run")
     assert [p["point_index"] for p in rescue["request"]["points"]] == [1]
@@ -89,10 +92,7 @@ def test_six_lifecycle_operations_mixed_backends_and_frozen_spec(campaign_inputs
     assert [p["point_index"] for p in retry["request"]["points"]] == [1, 3]
     assert {r["reason"] for r in recovered["receipts"]} == {"PROMOTION_UNQUALIFIED_REFERENCE"}
     assert set(j["job_set_id"] for j in first["plan"]["jobs"]).isdisjoint(j["job_set_id"] for j in retry["plan"]["jobs"])
-    for job in retry["plan"]["jobs"]:
-        index = job["point_indices"][0]
-        assert job["argv"][job["argv"].index("--firstPoint") + 1] == str(index)
-        assert job["argv"][job["argv"].index("--lastPoint") + 1] == str(index)
+    assert [job["point_indices"] for job in retry["plan"]["jobs"]] == [[1], [3]]
     observed = invoke("status", campaign_id)
     assert observed["campaign_id"] == campaign_id
     assert observed["active_generation_id"] == initial["active_generation_id"]
@@ -208,11 +208,13 @@ def test_full_population_condor_planning_and_missing_provider(campaign_inputs, i
     assert plan["plan"]["capabilities"] == {"plan": True, "dispatch": False, "collect": False}
     jobs = plan["plan"]["jobs"]
     assert len({job["job_set_id"] for job in jobs}) == len(jobs)
-    assert len({job["argv"][job["argv"].index("-n") + 1] for job in jobs}) == len(jobs)
+    assert len({job["execution_provenance"]["output_label"] for job in jobs}) == len(jobs)
     assert len({(job["scan_id"], index) for job in jobs for index in job["point_indices"]}) == 26 * 2 * 5
     assert all(job["point_indices"] == list(range(5)) for job in jobs)
     job = plan["plan"]["jobs"][0]
-    assert "--firstPoint" not in job["argv"] and "--lastPoint" not in job["argv"]
+    assert job["command_argvs"][0][0] == "combine"
+    assert job["command_argvs"][0][job["command_argvs"][0].index("--firstPoint") + 1] == "0"
+    assert job["command_argvs"][0][job["command_argvs"][0].index("--lastPoint") + 1] == "4"
     assert job["point_indices"] == list(range(5))
     actual = invoke("plan", campaign_id, "--backend", "condor", backend_map=None)
     assert "not qualified" in invoke("dispatch", campaign_id, actual["request"]["attempt_id"], backend_map=None, expected=2)["error"]

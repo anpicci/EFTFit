@@ -2,9 +2,9 @@
 
 The canonical frontend is `Fitter/scripts/eftfit_campaign.py`. It manages a
 versioned local campaign envelope with one editable YAML. It does not submit
-fits. The shipped `condor` provider supports **no-submit planning only**;
-dispatch and collection through that provider remain unqualified. Interactive,
-Lobster and CRAB campaign providers are not implemented. Synthetic providers
+fits. The shipped `local` and `condor` providers support **no-execution planning
+only**; dispatch and collection through either remain unqualified. Lobster and
+CRAB campaign providers are not implemented. Synthetic providers
 exist only in tests and are not selectable in the installed CLI.
 
 ## One YAML
@@ -64,6 +64,7 @@ The examples assume the EFTFit repository root as the working directory.
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns create campaign.yml
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns status CAMPAIGN_ID
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns plan CAMPAIGN_ID --backend condor --dry-run
+python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns plan CAMPAIGN_ID --backend local --dry-run
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns retry CAMPAIGN_ID --backend condor --dry-run
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns rescue CAMPAIGN_ID --backend condor --strategy minimizer_strategy_1 --dry-run
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns restart CAMPAIGN_ID
@@ -96,27 +97,41 @@ locally. No grid size is selected by default.
 `--backend` takes precedence over the frozen optional default. Changing backend
 creates a new attempt in the same campaign/generation without changing the spec
 digest or point identities. Missing/unsupported providers produce a local error
-with no fallback. Status does not load providers. Providers may own distinct
-009A job-set identities for the same logical point. The frontend records the
+with no fallback. Status does not load providers. A direct-grid job-set identity
+is the same across local and Condor for the same campaign, generation, scan,
+selected original indices, scientific argv and workspace SHA. The frontend records the
 requested/actual provider, capabilities in the plan, runtime provenance (including
 maintained source hashes and whether the execution environment is unresolved) and
 execution links; provider names are not part of campaign or point identity.
 
 Without `--dry-run`, planning records an immutable planned attempt. It does not
 dispatch it. Plans contain argv arrays and predicted 009A links; these are not
-receipts proving that execution occurred. The Condor mapping uses the maintained
-configured argv and 009A digest functions. CombineTool owns the grid partition:
-a complete scan uses original `--points N` and `--split-points N`, producing one
-member covering indices `0..N-1` with one resolved first/last pair. Partial
-Condor plans fail closed: the current 009A producer schema requires split
-members for the entire original grid, so it cannot truthfully describe a sparse
-or nonzero recovery subset. Other campaign state functions and synthetic
-provider recovery remain usable. Real execution and target storage remain
-separately unqualified.
+receipts proving that execution occurred. A schema-4 EFTFit/009A direct-grid
+plan freezes the original `N`, exact selected indices and maximal contiguous
+intervals. Each interval has one typed expected member and one direct `combine`
+argv with exactly one `--points N`, `--firstPoint i`, and `--lastPoint j`.
+The local plan returns those argv arrays and distinct attempt working paths.
+The Condor plan renders the same argv arrays into a worker script and an
+explicit queue containing exactly the selected intervals. Planning runs no fit
+and submits nothing. The scripts, submit descriptions and working directories
+are projections requiring separate materialization and deployment review.
+`--gridPoints`, `--split-points` and CombineTool are excluded from new plans.
+Original indices and expected coordinates remain bound to the frozen campaign
+even for sparse retry/rescue.
+
+Historical schema-3 full-grid 009A manifests, attempts and final receipts
+retain their CombineTool identity and byte format. Their decoder remains
+available for old jobs; new campaign plans use direct `combine`. The schema-4
+member list binds job-set identity and is shared by both renderers, attempt
+records and member checks. A plan does not assert that a member exists or is a
+valid ROOT result. Native direct-grid recovery submission and aggregation are
+blocked pending execution and cross-member reference-NLL qualification. A
+valid member or byte-bound final sidecar alone does not establish compatible
+reference fits. Real execution and target storage remain separately unqualified.
 
 `dispatch CAMPAIGN_ID ATTEMPT_ID` and `collect CAMPAIGN_ID ATTEMPT_ID` expose
 the separate provider stages for integration tests and future qualified
-providers. Both fail clearly for shipped Condor capability. Dispatch records
+providers. Both fail clearly for shipped local and Condor capability. Dispatch records
 intent before calling a provider; an interrupted intent is never automatically
 resubmitted. Collection is read-only at the provider boundary, followed by
 scientific validation and an atomic batch of campaign receipts. There is no
@@ -191,7 +206,9 @@ tests or merely storing source files on NFS.
 ## Qualification boundary
 
 Implemented: single YAML, frozen provenance, all six lifecycle operations,
-full-grid no-submit Condor mapping, mixed-provider identity via two synthetic doubles,
+full and selected original-grid direct local/Condor no-submit mapping,
+schema-4 typed member/attempt validation with historical schema-3 readback,
+mixed-provider identity via two synthetic doubles,
 local crash/concurrency guards, ROOT-backed validation, isolated quarantine,
 and read-only dry runs.
 

@@ -7,7 +7,8 @@ from .campaign_backend import select_backend
 from .campaign_spec import digest, load_spec, planned_points
 from .campaign_state import campaign_store, new_id, checked_id
 from .execution_provenance import (file_identity, read_json, sha256_file,
-                                   validate_execution_identity, validate_workspace_identity)
+                                   validate_direct_attempt_record, validate_execution_identity,
+                                   validate_workspace_identity)
 from .scan_1d import read_scan
 
 
@@ -244,6 +245,7 @@ def plan(root, campaign_id, operation="plan", backend=None, strategy=None, dry_r
         validate_workspace_identity(spec["workspace"])
         request = {"campaign_id": campaign_id, "generation_id": observed["active_generation_id"],
                    "attempt_id": "0" * 32 if dry_run else new_id(), "spec_digest": snapshot["campaign"]["spec_digest"],
+                   "execution_root": str((store.path / "execution").resolve()),
                    "operation": operation, "requested_backend": provider.name, "points": points,
                    "strategy": strategy, "numerical_difference": ({"--cminDefaultMinimizerStrategy": {"before": 0, "after": 1}} if strategy else {})}
         mapped = provider.plan(request, spec)
@@ -311,11 +313,19 @@ def validate_member(attempt, link, member, spec):
         raise ValueError("009A job/workspace linkage mismatch")
     if record["job_set_id"] != link["job_set_id"] or record["attempt_id"] != link["expected_execution_attempt_id"] or record["created_from"]["sha256"] != member["manifest"]["sha256"] or Path(record["created_from"]["path"]).resolve() != Path(member["manifest"]["resolved_path"]).resolve():
         raise ValueError("009A attempt linkage mismatch")
+    if manifest.get("schema") == 4:
+        validate_direct_attempt_record(manifest, record, member["manifest"]["sha256"])
+        if (link["point_indices"] != manifest["selected_indices"] or
+                manifest["execution_root"] != attempt["execution_root"]):
+            raise ValueError("direct-grid selected-member linkage mismatch")
     owned = member["member"]
     if owned not in manifest["expected_members"] or owned not in record["member_set"]:
         raise ValueError("009A member ownership mismatch")
     if any(not owned["first_point"] <= index <= owned["last_point"] for index in member["point_indices"]):
         raise ValueError("point index outside execution member")
+    if manifest.get("schema") == 4 and member["point_indices"] != list(range(
+            owned["first_point"], owned["last_point"] + 1)):
+        raise ValueError("direct-grid member mapping is incomplete or reordered")
     path = Path(member["path"]).resolve()
     execution_path = Path(manifest["execution_directory"])
     if not execution_path.is_absolute():
