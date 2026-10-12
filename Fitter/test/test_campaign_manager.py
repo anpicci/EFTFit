@@ -57,7 +57,7 @@ class synthetic_backend(condor_plan_backend):
         self.execution_owner = execution_owner
         self.cases = {}
 
-    def runtime(self):
+    def runtime(self, spec=None):
         return dict(runtime_identity(), provider=self.name, synthetic=True, execution_environment="synthetic")
 
     def plan(self, request, spec):
@@ -316,16 +316,20 @@ def test_direct_grid_scans_provider_generation_and_collision(campaign_inputs):
     assert {job["job_set_id"] for job in manager.plan(root, campaign_id,
         backend="condor", dry_run=True)["plan"]["jobs"]}.isdisjoint(
             job["job_set_id"] for job in condor_jobs)
-    # A pre-existing identity-owned output must block a new campaign attempt.
+    # A collision blocks only its exact attempt root; a fresh attempt is isolated.
     restarted = manager.plan(root, campaign_id, backend="condor", dry_run=True)
     member = restarted["plan"]["jobs"][0]["expected_members"][0]
     directory = Path(restarted["plan"]["jobs"][0]["execution_provenance"]["execution_directory"])
     directory.mkdir(parents=True)
     (directory / member["file_name"]).write_bytes(b"collision")
     before = snapshot_tree(root)
+    spec = state.campaign_store(root, campaign_id).read()["campaign"]["effective_spec"]
     with pytest.raises(ValueError, match="already exists"):
-        manager.plan(root, campaign_id, backend="condor")
+        condor_plan_backend().plan(restarted["request"], spec)
     assert snapshot_tree(root) == before
+    fresh = manager.plan(root, campaign_id, backend="condor")
+    assert fresh["request"]["execution_root"] != restarted["request"]["execution_root"]
+    assert fresh["plan"]["jobs"][0]["job_set_id"] == restarted["plan"]["jobs"][0]["job_set_id"]
 
 
 def test_direct_grid_member_receipt_uses_009a_attempt(campaign_inputs, eftfitter, monkeypatch):

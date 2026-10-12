@@ -1,14 +1,18 @@
-"""No-execution local and Condor renderers for one 009A direct-grid plan."""
+"""Provider-neutral 009A direct-grid planning and a local worker adapter."""
 
+from datetime import datetime, timezone
 import os
 import platform
 import re
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
-from .execution_provenance import (build_direct_grid_provenance, sha256_file,
-                                   validate_direct_grid_provenance)
+from .execution_provenance import (build_direct_attempt_record, build_direct_grid_provenance,
+                                   file_identity, read_json, sha256_file,
+                                   validate_direct_attempt_record, validate_direct_grid_provenance,
+                                   write_json_exclusive)
 from .wc_fit_config import build_configured_grid_scan_command
 from .campaign_spec import digest, fit_config, planned_points
 
@@ -98,9 +102,12 @@ class condor_plan_backend:
         jobs = []
         for scan_id, scan_points in sorted(scans.items()):
             point = scan_points[0]
+            # A worker-runtime binding cannot change the physical job identity.
+            scientific_digest = digest({key: value for key, value in spec.items()
+                                        if key != "local_runtime"})
             scan_name = ".campaign_" + digest({"campaign_id": request["campaign_id"],
                 "generation_id": request["generation_id"], "scan_id": scan_id,
-                "spec_digest": request["spec_digest"]})
+                "spec_digest": scientific_digest})
             provenance = build_direct_grid_provenance(
                 scan_name, grid_argv(spec, point, request["strategy"]), spec["workspace"],
                 spec["grid"]["points"], [p["point_index"] for p in scan_points],
@@ -134,7 +141,193 @@ class condor_plan_backend:
 
 class local_plan_backend(condor_plan_backend):
     name = "local"
-    capabilities = {"plan": True, "dispatch": False, "collect": False}
+    capabilities = {"plan": True, "dispatch": True, "collect": True}
+
+    def runtime(self, spec):
+        binding = spec.get("local_runtime")
+        if binding is None:
+            raise ValueError("local dispatch requires local_runtime in the frozen campaign YAML")
+        cmsset = Path(binding["cmsset_default"])
+        release_src = Path(binding["release_src"])
+        if not cmsset.is_file() or cmsset.is_symlink() or not release_src.is_dir():
+            raise ValueError("local worker CMSSW runtime paths are unavailable or unsafe")
+        return dict(runtime_identity(), provider=self.name,
+                    execution_environment="clean_nonlogin_cmssw",
+                    cmsset_default=file_identity(cmsset),
+                    release_src=str(release_src.resolve()), scram_arch=binding["scram_arch"])
+
+    def dispatch(self, attempt, spec, namespace):
+        namespace = Path(namespace)
+        if namespace != Path(attempt["execution_root"]):
+            raise ValueError("local attempt namespace differs from reserved execution root")
+        runtime = self.runtime(spec)
+        if attempt["dispatch"]["runtime"] != runtime:
+            raise ValueError("local worker runtime changed after dispatch intent")
+        mapped = self.plan(attempt, spec)
+        if [{key: job[key] for key in ("job_set_id", "scan_name", "scan_id", "point_indices",
+                                   "expected_execution_attempt_id")} for job in mapped["jobs"]] != attempt["execution_links"]:
+            raise ValueError("local execution differs from reserved 009A plan")
+        namespace.mkdir(parents=True, mode=0o700)
+        mapping = []
+        for job in mapped["jobs"]:
+            provenance = validate_direct_grid_provenance(job["execution_provenance"])
+            execution_directory = Path(provenance["execution_directory"])
+            manifest_path = execution_directory / "execution_provenance.json"
+            write_json_exclusive(manifest_path, provenance)
+            manifest_reference = file_identity(manifest_path)
+            attempt_directory = Path(provenance["scheduler_directory"]) / (
+                "campaign_" + attempt["attempt_id"])
+            attempt_directory.mkdir(parents=True, mode=0o700)
+            record_path = Path(provenance["attempts_directory"]) / (
+                job["expected_execution_attempt_id"] + ".json")
+            artifacts = []
+            for member in provenance["expected_members"]:
+                work_directory = attempt_directory / "member_{:04d}".format(member["member_index"])
+                artifacts.extend(str(work_directory / name) for name in (
+                    "worker_start.json", "worker_result.json", "runtime_resolution.txt",
+                    "stdout.txt", "stderr.txt"))
+            record = build_direct_attempt_record(provenance,
+                job["expected_execution_attempt_id"], attempt["operation"],
+                provenance["expected_members"], manifest_path, artifacts)
+            validate_direct_attempt_record(provenance, record, manifest_reference["sha256"])
+            write_json_exclusive(record_path, record)
+            record_reference = file_identity(record_path)
+            for member, argv in zip(provenance["expected_members"], provenance["command_argvs"]):
+                work_directory = attempt_directory / "member_{:04d}".format(member["member_index"])
+                work_directory.mkdir(mode=0o700)
+                start_path = work_directory / "worker_start.json"
+                result_path = work_directory / "worker_result.json"
+                resolution_path = work_directory / "runtime_resolution.txt"
+                stdout_path = work_directory / "stdout.txt"
+                stderr_path = work_directory / "stderr.txt"
+                write_json_exclusive(start_path, {"attempt_id": record["attempt_id"],
+                    "job_set_id": job["job_set_id"], "member": member,
+                    "command_argv": argv, "runtime": runtime,
+                    "started_utc": datetime.now(timezone.utc).isoformat()})
+                worker_script = ("set -euo pipefail -C\n"
+                    "ulimit -s unlimited\n"
+                    "source \"$1\"\n"
+                    "export SCRAM_ARCH=\"$2\"\n"
+                    "cd \"$3\"\n"
+                    "runtime_exports=\"$(scram runtime -sh)\"\n"
+                    "test -n \"$runtime_exports\"\n"
+                    "eval \"$runtime_exports\"\n"
+                    "resolved_combine=\"$(command -v combine)\"\n"
+                    "test -n \"$resolved_combine\"\n"
+                    "printf '%s\\n' \"SCRAM_ARCH=$SCRAM_ARCH\" \"CMSSW_BASE=${CMSSW_BASE-}\" \"combine_executable=$resolved_combine\" \"stack=$(ulimit -s)\" > \"$5\"\n"
+                    "cd \"$4\"\n"
+                    "shift 5\n"
+                    "exec \"$@\"\n")
+                worker_command = ["/bin/bash", "--noprofile", "--norc", "-c", worker_script,
+                    "eftfit_local_worker", runtime["cmsset_default"]["resolved_path"],
+                    runtime["scram_arch"], runtime["release_src"], str(work_directory),
+                    str(resolution_path), *argv]
+                worker_environment = {"PATH": "/usr/bin:/bin"}
+                for key in ("HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP"):
+                    if key in os.environ:
+                        worker_environment[key] = os.environ[key]
+                outcome = {"attempt_id": record["attempt_id"], "job_set_id": job["job_set_id"],
+                           "member": member, "command_argv": argv, "runtime": runtime,
+                           "stdout": str(stdout_path), "stderr": str(stderr_path),
+                           "finished_utc": None, "exit_code": None, "status": "launch_failed"}
+                try:
+                    if file_identity(runtime["cmsset_default"]["resolved_path"]) != runtime["cmsset_default"]:
+                        raise ValueError("local CMSSW setup changed after dispatch intent")
+                    with stdout_path.open("x", encoding="utf-8") as stdout, stderr_path.open("x", encoding="utf-8") as stderr:
+                        completed = subprocess.run(worker_command, cwd=work_directory,
+                            env=worker_environment, stdout=stdout, stderr=stderr, check=False)
+                    outcome["exit_code"] = completed.returncode
+                    outcome["status"] = "completed" if completed.returncode == 0 else "nonzero"
+                    if completed.returncode == 0:
+                        try:
+                            resolved_runtime = dict(line.split("=", 1) for line in
+                                resolution_path.read_text(encoding="utf-8").splitlines())
+                        except (OSError, ValueError):
+                            resolved_runtime = {}
+                        if (set(resolved_runtime) != {"SCRAM_ARCH", "CMSSW_BASE", "combine_executable", "stack"} or
+                                resolved_runtime["SCRAM_ARCH"] != runtime["scram_arch"] or
+                                resolved_runtime["stack"] != "unlimited" or
+                                not resolved_runtime["combine_executable"].startswith("/")):
+                            outcome["status"] = "runtime_unresolved"
+                        else:
+                            outcome["resolved_runtime"] = resolved_runtime
+                    if outcome["status"] == "completed":
+                        worker_output = work_directory / member["file_name"]
+                        destination = execution_directory / member["file_name"]
+                        if worker_output.is_symlink() or (worker_output.exists() and not worker_output.is_file()):
+                            outcome["status"] = "unsafe_output"
+                        elif worker_output.is_file():
+                            try:
+                                os.link(worker_output, destination, follow_symlinks=False)
+                            except FileExistsError:
+                                outcome["status"] = "collision"
+                except OSError as error:
+                    outcome["error"] = str(error)
+                outcome["finished_utc"] = datetime.now(timezone.utc).isoformat()
+                write_json_exclusive(result_path, outcome)
+                mapping.append({"job_set_id": job["job_set_id"],
+                    "point_indices": list(range(member["first_point"], member["last_point"] + 1)),
+                    "manifest": manifest_reference, "attempt_record": record_reference,
+                    "member": member, "path": str(execution_directory / member["file_name"]),
+                    "worker_result": file_identity(result_path)})
+        write_json_exclusive(namespace / "mapping.json", mapping)
+
+    def collect(self, attempt, namespace):
+        namespace = Path(namespace)
+        if namespace != Path(attempt["execution_root"]):
+            raise ValueError("local attempt namespace differs from reserved execution root")
+        mapping_path = namespace / "mapping.json"
+        if not mapping_path.is_file() or mapping_path.is_symlink():
+            raise RuntimeError("unknown local worker state: complete mapping is absent")
+        mapping = read_json(mapping_path)
+        if not isinstance(mapping, list) or not mapping:
+            raise RuntimeError("unknown local worker state: invalid mapping")
+        observed_members = set()
+        expected_members = set()
+        for item in mapping:
+            link = next((link for link in attempt["execution_links"]
+                         if link["job_set_id"] == item["job_set_id"]), None)
+            if link is None or item["point_indices"] != list(range(
+                    item["member"]["first_point"], item["member"]["last_point"] + 1)):
+                raise ValueError("foreign local execution mapping")
+            manifest = validate_direct_grid_provenance(read_json(item["manifest"]["resolved_path"]))
+            record = read_json(item["attempt_record"]["resolved_path"])
+            if (file_identity(item["manifest"]["resolved_path"]) != item["manifest"] or
+                    file_identity(item["attempt_record"]["resolved_path"]) != item["attempt_record"] or
+                    record["attempt_id"] != link["expected_execution_attempt_id"] or
+                    item["member"] not in manifest["expected_members"] or
+                    manifest["scan_name"] != link["scan_name"] or
+                    manifest["selected_indices"] != link["point_indices"] or
+                    manifest["execution_root"] != attempt["execution_root"] or
+                    record["created_from"]["path"] != item["manifest"]["resolved_path"] or
+                    item["path"] != str(Path(manifest["execution_directory"]) / item["member"]["file_name"])):
+                raise ValueError("local 009A mapping identity changed")
+            validate_direct_attempt_record(manifest, record, item["manifest"]["sha256"])
+            expected_members.update((link["job_set_id"], member["member_index"])
+                                    for member in record["member_set"])
+            observed_members.add((link["job_set_id"], item["member"]["member_index"]))
+            result_reference = item["worker_result"]
+            if result_reference["resolved_path"] not in record["scheduler_artifacts"]:
+                raise ValueError("local worker outcome is foreign to 009A attempt")
+            if file_identity(result_reference["resolved_path"]) != result_reference:
+                raise RuntimeError("unknown local worker state: outcome changed")
+            result = read_json(result_reference["resolved_path"])
+            if (result["attempt_id"] != record["attempt_id"] or
+                    result["job_set_id"] != link["job_set_id"] or
+                    result["member"] != item["member"] or
+                    result["command_argv"] != manifest["command_argvs"][item["member"]["member_index"]] or
+                    result["status"] not in ("completed", "nonzero", "launch_failed", "collision", "unsafe_output", "runtime_unresolved") or
+                    (result["status"] == "completed" and (result["exit_code"] != 0 or
+                        not isinstance(result.get("resolved_runtime"), dict))) or
+                    (result["status"] == "nonzero" and (type(result["exit_code"]) is not int or result["exit_code"] == 0)) or
+                    (result["status"] in ("collision", "unsafe_output", "runtime_unresolved") and result["exit_code"] != 0)):
+                raise RuntimeError("unknown local worker state: outcome identity invalid")
+            item["worker_status"] = result["status"]
+            item["worker_exit_code"] = result["exit_code"]
+        if observed_members != expected_members or {job_set_id for job_set_id, _ in observed_members} != {
+                link["job_set_id"] for link in attempt["execution_links"]} or len(observed_members) != len(mapping):
+            raise RuntimeError("unknown local worker state: incomplete or duplicate member mapping")
+        return mapping
 
 
 def select_backend(name, backends=None):
@@ -142,7 +335,7 @@ def select_backend(name, backends=None):
     if name is None:
         raise ValueError("select --backend explicitly or set backend in the campaign YAML")
     if name not in providers:
-        raise ValueError("backend {!r} is unavailable; no fallback (shipped: condor and local, plan only)".format(name))
+        raise ValueError("backend {!r} is unavailable; no fallback (shipped: condor planning and local execution)".format(name))
     provider = providers[name]
     if provider.name != name or not provider.capabilities.get("plan"):
         raise ValueError("provider identity or plan capability mismatch")

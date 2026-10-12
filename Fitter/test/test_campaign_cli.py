@@ -3,16 +3,21 @@
 import importlib.util
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 
+import numpy as np
 import pytest
+import uproot
 import yaml
 
 from test_campaign_manager import campaign_inputs, providers, eftfitter, snapshot_tree
 from python.campaign_backend import condor_plan_backend
+from python import campaign_backend
 from python import campaign_state as state
-from python.execution_provenance import sha256_file
+from python.campaign_spec import load_spec, planned_points
+from python.execution_provenance import read_json, sha256_file
 
 cli_path = Path(__file__).resolve().parents[1] / "scripts" / "eftfit_campaign.py"
 cli_spec = importlib.util.spec_from_file_location("eftfit_campaign_cli", cli_path)
@@ -29,6 +34,231 @@ def invoke(capsys, campaign_inputs, providers):
         assert code == expected, captured.err
         return json.loads(captured.out if code == 0 else captured.err)
     return run
+
+
+@pytest.fixture
+def native_inputs(campaign_inputs, tmp_path, monkeypatch):
+    source, data, root = campaign_inputs
+    config = tmp_path / "package" / "config" / "TOP_26_006.yml"
+    package_config = yaml.safe_load(config.read_text())
+    package_config["wc_population"]["scientific"] = ["ctG"]
+    package_config["wc_ranges"] = {"ctG": [-1.6, 1.6]}
+    config.write_text(yaml.safe_dump(package_config))
+    data["package"]["sha256"] = sha256_file(config)
+    data["selection"]["wcs"] = ["ctG"]
+    data["grid"]["selected_indices"] = [3]
+    data["backend"] = "local"
+    release_src = tmp_path / "release" / "src"
+    release_src.mkdir(parents=True)
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir()
+    setup = tmp_path / "cmsset_default.sh"
+    setup.write_text("export PATH={}:$PATH\n".format(shlex.quote(str(fake_bin))))
+    scram = fake_bin / "scram"
+    scram.write_text("#!/bin/sh\n[ \"$1\" = runtime ] && [ \"$2\" = -sh ] || exit 2\n"
+                     "printf '%s\\n' 'export WORKER_SCRAM_READY=yes'\n")
+    scram.chmod(0o700)
+    data["local_runtime"] = {"cmsset_default": str(setup), "scram_arch": "synthetic_arch",
+                             "release_src": str(release_src)}
+    source.write_text(yaml.safe_dump(data))
+    spec, _ = load_spec(source)
+    coordinate = next(point["coordinate"] for point in planned_points(spec)
+                      if point["point_index"] == data["grid"]["selected_indices"][0])
+    valid_root = tmp_path / "valid.root"
+    numeric_root = tmp_path / "numeric.root"
+    for path, delta in ((valid_root, 1.0), (numeric_root, 9990.0)):
+        with uproot.recreate(path) as output:
+            tree = output.mktree("limit", {"ctG": "float32", "deltaNLL": "float32",
+                                         "quantileExpected": "float32"})
+            tree.extend({"ctG": np.array([coordinate], dtype="f4"),
+                         "deltaNLL": np.array([delta], dtype="f4"),
+                         "quantileExpected": np.array([0], dtype="f4")})
+    invalid_root = tmp_path / "invalid.root"
+    invalid_root.write_bytes(b"invalid ROOT bytes")
+    mode = tmp_path / "worker_mode.txt"
+    mode.write_text("success")
+    combine = fake_bin / "combine"
+    combine.write_text("#!/bin/sh\nset -eu\n"
+        "[ \"$SCRAM_ARCH\" = synthetic_arch ]\n"
+        "[ \"$WORKER_SCRAM_READY\" = yes ]\n"
+        "[ \"$(ulimit -s)\" = unlimited ]\n"
+        "[ -z \"${PYTHONPATH+x}\" ] && [ -z \"${CONDA_PREFIX+x}\" ] && [ -z \"${LD_LIBRARY_PATH+x}\" ]\n"
+        "printf '%s\\n' \"$@\" > argv.txt\n"
+        "printf 'python=%s conda=%s library=%s stack=%s\\n' \"${PYTHONPATH-unset}\" \"${CONDA_PREFIX-unset}\" \"${LD_LIBRARY_PATH-unset}\" \"$(ulimit -s)\" > worker_env.txt\n"
+        "label=\nwhile [ \"$#\" -gt 0 ]; do\n"
+        "  if [ \"$1\" = -n ]; then shift; label=\"$1\"; fi\n"
+        "  shift\ndone\n" +
+        "mode=$(cat {})\n".format(shlex.quote(str(mode))) +
+        "[ \"$mode\" != nonzero ] || exit 17\n"
+        "[ \"$mode\" != missing ] || exit 0\n"
+        "case \"$mode\" in\n"
+        "  invalid) source={} ;;\n".format(shlex.quote(str(invalid_root))) +
+        "  numerical) source={} ;;\n".format(shlex.quote(str(numeric_root))) +
+        "  *) source={} ;;\n".format(shlex.quote(str(valid_root))) +
+        "esac\ncp -- \"$source\" \"higgsCombine${label}.MultiDimFit.mH120.root\"\n")
+    combine.chmod(0o700)
+    monkeypatch.setenv("PYTHONPATH", "poisoned_controller")
+    monkeypatch.setenv("CONDA_PREFIX", "poisoned_controller")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "poisoned_controller")
+    return source, root, mode, coordinate
+
+
+@pytest.fixture
+def invoke_native(capsys, native_inputs):
+    _, root, _, _ = native_inputs
+    def run(*args, expected=0):
+        code = cli.main(["--root", str(root), *map(str, args)], backends=None)
+        captured = capsys.readouterr()
+        assert code == expected, captured.err
+        return json.loads(captured.out if code == 0 else captured.err)
+    return run
+
+
+def test_native_local_singleton_cli_and_009a_receipt(native_inputs, invoke_native):
+    source, root, _, coordinate = native_inputs
+    created = invoke_native("create", source)
+    campaign_id = created["campaign_id"]
+    preview = invoke_native("plan", campaign_id, "--dry-run")
+    assert preview["request"]["attempt_id"] == "0" * 32
+    assert invoke_native("status", campaign_id)["attempts"] == []
+    planned = invoke_native("plan", campaign_id)
+    attempt_id = planned["request"]["attempt_id"]
+    job = planned["plan"]["jobs"][0]
+    assert attempt_id != "0" * 32
+    assert job["point_indices"] == [3]
+    assert job["execution_provenance"]["original_points"] == 5
+    assert coordinate == pytest.approx(0.8)
+    assert job["command_argvs"][0].count("--points") == 1
+    assert job["command_argvs"][0][job["command_argvs"][0].index("--points") + 1] == "5"
+    assert job["command_argvs"][0][-6:-1] == ["--firstPoint", "3", "--lastPoint", "3", "-n"]
+    condor_preview = invoke_native("plan", campaign_id, "--backend", "condor", "--dry-run")
+    assert condor_preview["plan"]["jobs"][0]["job_set_id"] == job["job_set_id"]
+    invoke_native("dispatch", campaign_id, attempt_id)
+    assert invoke_native("status", campaign_id)["attempts"][0]["runtime"]["provider"] == "local"
+    collected = invoke_native("collect", campaign_id, attempt_id)
+    receipt = collected["receipts"][0]
+    assert receipt["status"] == "accepted"
+    assert receipt["execution_link"]["job_set_id"] == job["job_set_id"]
+    assert len(receipt["references"]) == 4
+    manifest = read_json(receipt["references"][0]["resolved_path"])
+    record = read_json(receipt["references"][1]["resolved_path"])
+    worker_result = read_json(receipt["references"][2]["resolved_path"])
+    assert manifest["schema"] == 4 and manifest["selected_indices"] == [3]
+    assert record["attempt_id"] == "campaign_" + attempt_id
+    assert record["member_set"] == manifest["expected_members"]
+    assert worker_result["resolved_runtime"]["combine_executable"].endswith("/fake_bin/combine")
+    assert worker_result["resolved_runtime"]["stack"] == "unlimited"
+    work_directory = Path(manifest["scheduler_directory"]) / record["attempt_id"] / "member_0000"
+    assert (work_directory / "argv.txt").read_text().splitlines() == job["command_argvs"][0][1:]
+    assert "python=unset conda=unset library=unset stack=unlimited" in (work_directory / "worker_env.txt").read_text()
+    assert invoke_native("status", campaign_id)["points"][3]["status"] == "accepted"
+    assert "already dispatched" in invoke_native("dispatch", campaign_id, attempt_id, expected=2)["error"]
+    assert "already collected" in invoke_native("collect", campaign_id, attempt_id, expected=2)["error"]
+    assert invoke_native("retry", campaign_id)["status"] == "no_eligible_points"
+
+
+@pytest.mark.parametrize("mode, expected_status", [("nonzero", "invalid"),
+    ("missing", "missing"), ("invalid", "invalid"), ("numerical", "invalid")])
+def test_native_local_terminal_retry(native_inputs, invoke_native, mode, expected_status):
+    source, _, mode_path, _ = native_inputs
+    mode_path.write_text(mode)
+    campaign_id = invoke_native("create", source)["campaign_id"]
+    planned = invoke_native("plan", campaign_id)
+    attempt_id = planned["request"]["attempt_id"]
+    invoke_native("dispatch", campaign_id, attempt_id)
+    receipt = invoke_native("collect", campaign_id, attempt_id)["receipts"][0]
+    assert receipt["status"] == expected_status
+    if mode == "nonzero":
+        assert "nonzero" in receipt["reason"] and "17" in receipt["reason"]
+    if mode == "numerical":
+        assert "invalid evaluation point" in receipt["reason"]
+        rescue = invoke_native("rescue", campaign_id, "--strategy", "minimizer_strategy_1")
+        next_attempt = rescue["request"]["attempt_id"]
+    else:
+        retry = invoke_native("retry", campaign_id)
+        next_attempt = retry["request"]["attempt_id"]
+    assert next_attempt != attempt_id
+    mode_path.write_text("success")
+    invoke_native("dispatch", campaign_id, next_attempt)
+    recovered = invoke_native("collect", campaign_id, next_attempt)["receipts"][0]
+    assert recovered["status"] == "accepted"
+    if mode == "numerical":
+        assert recovered["execution_link"]["job_set_id"] != planned["plan"]["jobs"][0]["job_set_id"]
+    else:
+        assert recovered["execution_link"]["job_set_id"] == planned["plan"]["jobs"][0]["job_set_id"]
+    assert recovered["references"][-1]["resolved_path"] != receipt["references"][-1]["resolved_path"]
+
+
+def test_native_local_collision_and_unknown_intent(native_inputs, invoke_native, monkeypatch):
+    source, root, _, _ = native_inputs
+    campaign_id = invoke_native("create", source)["campaign_id"]
+    plan = invoke_native("plan", campaign_id)
+    attempt_id = plan["request"]["attempt_id"]
+    manifest = plan["plan"]["jobs"][0]["execution_provenance"]
+    destination = Path(manifest["execution_directory"]) / manifest["expected_members"][0]["file_name"]
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"foreign output")
+    assert "already exists" in invoke_native("dispatch", campaign_id, attempt_id, expected=2)["error"]
+    assert destination.read_bytes() == b"foreign output"
+    assert "unknown local worker state" in invoke_native("collect", campaign_id, attempt_id, expected=2)["error"]
+    assert invoke_native("status", campaign_id)["points"][3]["status"] == "running"
+    assert invoke_native("retry", campaign_id)["status"] == "no_eligible_points"
+
+    second = invoke_native("plan", campaign_id, "--dry-run")
+    assert second["status"] == "no_eligible_points"
+    next_campaign = invoke_native("create", source)["campaign_id"]
+    next_attempt = invoke_native("plan", next_campaign)["request"]["attempt_id"]
+    with monkeypatch.context() as patch:
+        def interrupted(*args, **kwargs):
+            raise KeyboardInterrupt
+        patch.setattr(campaign_backend.subprocess, "run", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            cli.main(["--root", str(root), "dispatch", next_campaign, next_attempt], backends=None)
+    assert "unknown local worker state" in invoke_native("collect", next_campaign, next_attempt, expected=2)["error"]
+    assert invoke_native("status", next_campaign)["points"][3]["status"] == "running"
+
+
+def test_native_local_requires_frozen_runtime_before_intent(native_inputs, invoke_native):
+    source, _, _, _ = native_inputs
+    data = yaml.safe_load(source.read_text())
+    del data["local_runtime"]
+    source.write_text(yaml.safe_dump(data))
+    campaign_id = invoke_native("create", source)["campaign_id"]
+    attempt_id = invoke_native("plan", campaign_id)["request"]["attempt_id"]
+    assert "requires local_runtime" in invoke_native("dispatch", campaign_id, attempt_id, expected=2)["error"]
+    assert invoke_native("status", campaign_id)["points"][3]["status"] == "planned"
+
+
+def test_native_local_scram_failure_cannot_run_worker(native_inputs, invoke_native):
+    source, _, _, _ = native_inputs
+    setup = Path(yaml.safe_load(source.read_text())["local_runtime"]["cmsset_default"])
+    scram = setup.parent / "fake_bin" / "scram"
+    scram.write_text("#!/bin/sh\necho 'synthetic runtime failure' >&2\nexit 9\n")
+    scram.chmod(0o700)
+    campaign_id = invoke_native("create", source)["campaign_id"]
+    attempt_id = invoke_native("plan", campaign_id)["request"]["attempt_id"]
+    invoke_native("dispatch", campaign_id, attempt_id)
+    receipt = invoke_native("collect", campaign_id, attempt_id)["receipts"][0]
+    assert receipt["status"] == "invalid" and "nonzero" in receipt["reason"]
+    assert receipt["reference_group"] is None
+
+
+@pytest.mark.parametrize("tamper", ["manifest", "member"])
+def test_native_local_rejects_foreign_mapping(native_inputs, invoke_native, tamper):
+    source, root, _, _ = native_inputs
+    campaign_id = invoke_native("create", source)["campaign_id"]
+    attempt_id = invoke_native("plan", campaign_id)["request"]["attempt_id"]
+    invoke_native("dispatch", campaign_id, attempt_id)
+    mapping_path = root / campaign_id / "execution" / attempt_id / "mapping.json"
+    mapping = read_json(mapping_path)
+    if tamper == "manifest":
+        Path(mapping[0]["manifest"]["resolved_path"]).write_text("{}")
+    else:
+        mapping[0]["member"]["first_point"] = 1
+        mapping_path.write_text(json.dumps(mapping))
+    result = invoke_native("collect", campaign_id, attempt_id, expected=2)
+    assert "error" in result
+    assert invoke_native("status", campaign_id)["points"][3]["status"] == "running"
 
 
 def run_attempt(invoke, campaign_id, backend, operation="plan", scan_id=None):

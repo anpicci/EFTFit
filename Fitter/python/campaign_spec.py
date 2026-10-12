@@ -45,7 +45,7 @@ def load_spec(path):
     source = path.read_text(encoding="utf-8")
     data = yaml.load(source, Loader=campaign_yaml_loader)
     fields(data, {"schema_version", "package", "workspace", "dataset", "selection", "grid"},
-           {"fit_start_values", "backend", "keep_failures"})
+           {"fit_start_values", "backend", "keep_failures", "local_runtime"})
     if type(data["schema_version"]) is not int or data["schema_version"] != 1:
         raise ValueError("unsupported campaign schema_version")
     if data.get("keep_failures", False) is not False:
@@ -113,12 +113,25 @@ def load_spec(path):
     backend = data.get("backend")
     if backend is not None and (not isinstance(backend, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", backend)):
         raise ValueError("backend must be a provider name")
+    local_runtime = data.get("local_runtime")
+    if local_runtime is not None:
+        fields(local_runtime, {"cmsset_default", "scram_arch", "release_src"})
+        if not isinstance(local_runtime["scram_arch"], str) or not re.fullmatch(
+                r"[A-Za-z0-9_]+", local_runtime["scram_arch"]):
+            raise ValueError("local_runtime.scram_arch must be a simple architecture name")
+        local_runtime = dict(local_runtime)
+        for key in ("cmsset_default", "release_src"):
+            if not isinstance(local_runtime[key], str) or not local_runtime[key]:
+                raise ValueError("local_runtime paths must be nonempty strings")
+            local_runtime[key] = str(input_path(local_runtime[key]))
     effective = {"schema_version": 1, "package": package_identity, "workspace": workspace,
                  "dataset": effective_dataset, "selection": {"wcs": wcs, "modes": modes},
                  "grid": effective_grid, "fit_start_values": starts, "default_backend": backend,
                  "keep_failures": False,
                  "fit_config": {"analysis": config.analysis, "scientific_wcs": config.scientific_wcs,
                                 "fixed_wcs": config.fixed_wcs, "wc_ranges": config.wc_ranges}}
+    if local_runtime is not None:
+        effective["local_runtime"] = local_runtime
     # JSON normalization makes in-memory and reopened representations identical.
     return json.loads(canonical_json_bytes(effective)), source
 

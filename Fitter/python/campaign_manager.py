@@ -117,8 +117,11 @@ def status(root, campaign_id):
         points = {point_key(p): dict(p, status="planned", reason="no scientific receipt", canonical=None)
                   for p in active["points"]}
         for attempt in attempts.values():
-            result["attempts"].append({key: attempt[key] for key in (
-                "attempt_id", "generation_id", "requested_backend", "actual_backend", "runtime", "execution_links")})
+            summary = {key: attempt[key] for key in (
+                "attempt_id", "generation_id", "requested_backend", "actual_backend", "runtime", "execution_links")}
+            if attempt["dispatch"]:
+                summary["runtime"] = attempt["dispatch"]["runtime"]
+            result["attempts"].append(summary)
             if attempt["generation_id"] != active["generation_id"]:
                 continue
             for point in attempt["points"]:
@@ -246,9 +249,10 @@ def plan(root, campaign_id, operation="plan", backend=None, strategy=None, dry_r
         # Input identities are needed only by execution planning, never status/clone/restart.
         verify_reference(spec["package"])
         validate_workspace_identity(spec["workspace"])
+        attempt_id = "0" * 32 if dry_run else new_id()
         request = {"campaign_id": campaign_id, "generation_id": observed["active_generation_id"],
-                   "attempt_id": "0" * 32 if dry_run else new_id(), "spec_digest": snapshot["campaign"]["spec_digest"],
-                   "execution_root": str((store.path / "execution").resolve()),
+                   "attempt_id": attempt_id, "spec_digest": snapshot["campaign"]["spec_digest"],
+                   "execution_root": str((store.path / "execution" / attempt_id).resolve()),
                    "operation": operation, "requested_backend": provider.name, "points": points,
                    "strategy": strategy, "numerical_difference": ({"--cminDefaultMinimizerStrategy": {"before": 0, "after": 1}} if strategy else {})}
         mapped = provider.plan(request, spec)
@@ -296,7 +300,8 @@ def dispatch(root, campaign_id, attempt_id, dry_run=False, backends=None):
         validate_workspace_identity(spec["workspace"])
         # Write intent BEFORE calling a provider: interruption is never resubmitted.
         snapshot = store.append(snapshot, "dispatch", {"attempt_id": attempt_id,
-                              "runtime": provider.runtime(), "state": "intent"})
+                              "runtime": provider.runtime(spec), "state": "intent"})
+        attempt = active_attempt(snapshot, attempt_id)
         provider.dispatch(attempt, spec, store.path / "execution" / attempt_id)
         return status(root, campaign_id)
     if dry_run:
@@ -308,6 +313,8 @@ def dispatch(root, campaign_id, attempt_id, dry_run=False, backends=None):
 def validate_member(attempt, link, member, spec):
     """Bind an independently read ROOT file to immutable 009A job/attempt/member evidence."""
     references = [member["manifest"], member["attempt_record"]]
+    if "worker_result" in member:
+        references.append(member["worker_result"])
     for reference in references:
         verify_reference(reference)
     manifest = validate_execution_identity(read_json(member["manifest"]["resolved_path"]))
@@ -359,11 +366,11 @@ def collect(root, campaign_id, attempt_id, dry_run=False, backends=None):
         if not attempt["dispatch"]:
             raise ValueError("attempt has not been dispatched")
         spec = snapshot["campaign"]["effective_spec"]
-        # collect() must be a read-only provider operation, including during dry-run.
-        members = provider.collect(attempt, store.path / "execution" / attempt_id)
         _, _, _, prior = current_state(snapshot)
         if any(r["attempt_id"] == attempt_id for r in prior):
             raise ValueError("attempt already collected; recovery creates a new attempt")
+        # collect() must be a read-only provider operation, including during dry-run.
+        members = provider.collect(attempt, store.path / "execution" / attempt_id)
         anchors = {}
         for receipt in prior:
             if receipt["generation_id"] == attempt["generation_id"] and receipt["status"] == "accepted":
@@ -390,6 +397,13 @@ def collect(root, campaign_id, attempt_id, dry_run=False, backends=None):
                 link, member = mapped
                 receipt["execution_link"] = {"job_set_id": link["job_set_id"], "attempt_id": link["expected_execution_attempt_id"], "member": member["member"]}
                 receipt["references"] = [member["manifest"], member["attempt_record"]]
+                if "worker_result" in member:
+                    receipt["references"].append(member["worker_result"])
+                if member.get("worker_status") not in (None, "completed"):
+                    receipt.update(status="invalid", reason="local worker " + member["worker_status"] +
+                                   " (exit_code={})".format(member.get("worker_exit_code")))
+                    receipts.append(receipt)
+                    continue
                 cache_key = (link["job_set_id"], member["path"])
                 if cache_key not in validations:
                     try:

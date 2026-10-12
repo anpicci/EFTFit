@@ -1,10 +1,11 @@
 # Campaign lifecycle
 
 The canonical frontend is `Fitter/scripts/eftfit_campaign.py`. It manages a
-versioned local campaign envelope with one editable YAML. It does not submit
-fits. The shipped `local` and `condor` providers support **no-execution planning
-only**; dispatch and collection through either remain unqualified. Lobster and
-CRAB campaign providers are not implemented. Synthetic providers
+versioned local campaign envelope with one editable YAML. The shipped `local`
+provider dispatches and collects direct Combine members. Its process and
+receipt lifecycle has synthetic test coverage; real CMSSW execution requires
+separate owner qualification. The `condor` provider remains no-submit planning
+only. Lobster and CRAB campaign providers are not implemented. Synthetic providers
 exist only in tests and are not selectable in the installed CLI.
 
 ## One YAML
@@ -28,6 +29,11 @@ grid:
   align_edges: true  # explicit; false selects bin centers
   selected_indices: [1, 3]  # optional original-grid work request
 backend: condor       # optional default for new execution plans
+# To dispatch locally, add to this same YAML:
+# local_runtime:
+#   cmsset_default: /path/to/cmsset_default.sh
+#   scram_arch: <supported SCRAM_ARCH>
+#   release_src: /path/to/CMSSW/src
 keep_failures: false
 ```
 
@@ -38,6 +44,17 @@ workspace. The observed dataset name is a workspace object name; external
 `file:dataset` selectors are unsupported because their bytes would require an
 additional identity contract. Dataset presence and workspace scientific
 qualification remain prerequisites to future real execution.
+
+`local_runtime` is optional for planning and required for local dispatch. It
+contains typed setup-script, architecture, and release-source bindings;
+arbitrary shell commands are not accepted. The worker starts non-login Bash
+with a small environment allowlist, sets an unlimited stack, sources the
+selected setup file, resolves `scram runtime -sh` under the selected
+`SCRAM_ARCH`, and executes the planner's exact `combine` argv. Controller
+`PYTHONPATH`, Conda variables, and `LD_LIBRARY_PATH` are excluded. Dispatch
+records the setup file identity; the worker outcome records the resolved
+`combine` path, architecture, CMSSW base and stack. Runtime settings do not
+enter the scientific job-set identity.
 
 For runtime Asimov generation, use `dataset: {mode: expected, truth: sm}`.
 The frozen effective spec records `nuisance_generation: nominal`; the plan
@@ -102,6 +119,9 @@ python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns retry CAMPAIG
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns rescue CAMPAIGN_ID --backend condor --strategy minimizer_strategy_1 --dry-run
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns restart CAMPAIGN_ID
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns clone CAMPAIGN_ID
+python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns plan CAMPAIGN_ID --backend local
+python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns dispatch CAMPAIGN_ID ATTEMPT_ID
+python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns collect CAMPAIGN_ID ATTEMPT_ID
 ```
 
 `create` allocates a random campaign ID and one generation without submission.
@@ -144,6 +164,8 @@ plan freezes the original `N`, exact selected indices and maximal contiguous
 intervals. Each interval has one typed expected member and one direct `combine`
 argv with exactly one `--points N`, `--firstPoint i`, and `--lastPoint j`.
 The local plan returns those argv arrays and distinct attempt working paths.
+Each reserved attempt has its own execution root, so retries cannot replace
+earlier members even when the scientific job-set ID is unchanged.
 The Condor plan renders the same argv arrays into a worker script and an
 explicit queue containing exactly the selected intervals. Planning runs no fit
 and submits nothing. The scripts, submit descriptions and working directories
@@ -157,18 +179,23 @@ retain their CombineTool identity and byte format. Their decoder remains
 available for old jobs; new campaign plans use direct `combine`. The schema-4
 member list binds job-set identity and is shared by both renderers, attempt
 records and member checks. A plan does not assert that a member exists or is a
-valid ROOT result. Native direct-grid recovery submission and aggregation are
-blocked pending execution and cross-member reference-NLL qualification. A
+valid ROOT result. Condor recovery submission and aggregation remain blocked
+pending execution and cross-member reference-NLL qualification. A
 valid member or byte-bound final sidecar alone does not establish compatible
-reference fits. Real execution and target storage remain separately unqualified.
+reference fits. Real CMSSW execution and target storage remain separately unqualified.
 
-`dispatch CAMPAIGN_ID ATTEMPT_ID` and `collect CAMPAIGN_ID ATTEMPT_ID` expose
-the separate provider stages for integration tests and future qualified
-providers. Both fail clearly for shipped local and Condor capability. Dispatch records
-intent before calling a provider; an interrupted intent is never automatically
-resubmitted. Collection is read-only at the provider boundary, followed by
-scientific validation and an atomic batch of campaign receipts. There is no
-implicit dispatch from retry/rescue and no dynamic provider import from YAML.
+`dispatch CAMPAIGN_ID ATTEMPT_ID` and `collect CAMPAIGN_ID ATTEMPT_ID` are
+separate stages. Local dispatch records intent before launching a worker;
+interruption or missing completion evidence leaves an unknown intent that is
+never automatically resubmitted. Each worker has a private directory,
+stdout/stderr, start and outcome records, and a typed 009A manifest/attempt
+record. Successful worker output is linked exclusively to the exact expected
+member name. Nonzero exit, missing output and invalid ROOT are classified
+separately. Collection is read-only at the provider boundary; the campaign
+then commits one atomic batch of scientific receipts. Duplicate dispatch or
+collection is rejected. Condor dispatch and collection remain unavailable.
+There is no implicit dispatch from retry/rescue or dynamic provider import
+from YAML.
 
 All mutating commands support `--dry-run`: no IDs are reserved, directories
 created, lock files written, or state changed. A zero-filled attempt ID in a
@@ -265,7 +292,7 @@ mixed-provider identity via two synthetic doubles,
 local crash/concurrency guards, ROOT-backed validation, isolated quarantine,
 and read-only dry runs.
 
-Not yet production-qualified: real campaign provider dispatch/collection,
+Not yet production-qualified: real local CMSSW campaign dispatch/collection,
 cross-attempt/member NLL anchors, runtime Asimov truth, keepFailures initial-fit semantics,
 production storage, interval/grid precision and coverage, final scientific
 workspace authority, configured 2D and impacts presets. These are separate
