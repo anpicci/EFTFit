@@ -50,14 +50,15 @@ def native_inputs(campaign_inputs, tmp_path, monkeypatch):
     data["backend"] = "local"
     release_src = tmp_path / "release" / "src"
     release_src.mkdir(parents=True)
-    fake_bin = tmp_path / "fake_bin"
-    fake_bin.mkdir()
+    fake_bin = release_src.parent / "bin" / "synthetic_arch"
+    fake_bin.mkdir(parents=True)
     setup = tmp_path / "cmsset_default.sh"
-    setup.write_text("export PATH={}:$PATH\n".format(shlex.quote(str(fake_bin))))
-    scram = fake_bin / "scram"
-    scram.write_text("#!/bin/sh\n[ \"$1\" = runtime ] && [ \"$2\" = -sh ] || exit 2\n"
-                     "printf '%s\\n' 'export WORKER_SCRAM_READY=yes'\n")
-    scram.chmod(0o700)
+    setup.write_text("[[ \"$SCRAM_ARCH\" == synthetic_arch ]] || return 9\n"
+        "cmsenv() {\n" +
+        "  [[ \"$(pwd -P)\" == {} ]] || return 10\n".format(shlex.quote(str(release_src.resolve()))) +
+        "  export CMSSW_BASE={}\n".format(shlex.quote(str(release_src.parent))) +
+        "  export PATH={}:$PATH\n".format(shlex.quote(str(fake_bin))) +
+        "}\n")
     data["local_runtime"] = {"cmsset_default": str(setup), "scram_arch": "synthetic_arch",
                              "release_src": str(release_src)}
     source.write_text(yaml.safe_dump(data))
@@ -80,7 +81,7 @@ def native_inputs(campaign_inputs, tmp_path, monkeypatch):
     combine = fake_bin / "combine"
     combine.write_text("#!/bin/sh\nset -eu\n"
         "[ \"$SCRAM_ARCH\" = synthetic_arch ]\n"
-        "[ \"$WORKER_SCRAM_READY\" = yes ]\n"
+        "[ \"$CMSSW_BASE\" = {} ]\n".format(shlex.quote(str(release_src.parent))) +
         "[ \"$(ulimit -s)\" = unlimited ]\n"
         "[ -z \"${PYTHONPATH+x}\" ] && [ -z \"${CONDA_PREFIX+x}\" ] && [ -z \"${LD_LIBRARY_PATH+x}\" ]\n"
         "printf '%s\\n' \"$@\" > argv.txt\n"
@@ -146,7 +147,9 @@ def test_native_local_singleton_cli_and_009a_receipt(native_inputs, invoke_nativ
     assert manifest["schema"] == 4 and manifest["selected_indices"] == [3]
     assert record["attempt_id"] == "campaign_" + attempt_id
     assert record["member_set"] == manifest["expected_members"]
-    assert worker_result["resolved_runtime"]["combine_executable"].endswith("/fake_bin/combine")
+    assert worker_result["resolved_runtime"]["combine_executable"] == str(source.parent / "release" / "bin" / "synthetic_arch" / "combine")
+    assert worker_result["resolved_runtime"]["CMSSW_BASE"] == str(source.parent / "release")
+    assert worker_result["resolved_runtime"]["SCRAM_ARCH"] == "synthetic_arch"
     assert worker_result["resolved_runtime"]["stack"] == "unlimited"
     work_directory = Path(manifest["scheduler_directory"]) / record["attempt_id"] / "member_0000"
     assert (work_directory / "argv.txt").read_text().splitlines() == job["command_argvs"][0][1:]
@@ -229,18 +232,90 @@ def test_native_local_requires_frozen_runtime_before_intent(native_inputs, invok
     assert invoke_native("status", campaign_id)["points"][3]["status"] == "planned"
 
 
-def test_native_local_scram_failure_cannot_run_worker(native_inputs, invoke_native):
+def test_native_local_cmsenv_failure_cannot_run_worker(native_inputs, invoke_native):
     source, _, _, _ = native_inputs
     setup = Path(yaml.safe_load(source.read_text())["local_runtime"]["cmsset_default"])
-    scram = setup.parent / "fake_bin" / "scram"
-    scram.write_text("#!/bin/sh\necho 'synthetic runtime failure' >&2\nexit 9\n")
-    scram.chmod(0o700)
+    setup.write_text(setup.read_text().replace("  export CMSSW_BASE=", "  echo 'synthetic cmsenv failure' >&2\n  return 9\n  export CMSSW_BASE="))
     campaign_id = invoke_native("create", source)["campaign_id"]
     attempt_id = invoke_native("plan", campaign_id)["request"]["attempt_id"]
     invoke_native("dispatch", campaign_id, attempt_id)
     receipt = invoke_native("collect", campaign_id, attempt_id)["receipts"][0]
     assert receipt["status"] == "invalid" and "nonzero" in receipt["reason"]
     assert receipt["reference_group"] is None
+
+
+@pytest.mark.parametrize("base_mode", ["missing", "wrong_release"])
+def test_native_local_rejects_unbound_release(native_inputs, invoke_native, base_mode):
+    source, _, _, _ = native_inputs
+    setup = Path(yaml.safe_load(source.read_text())["local_runtime"]["cmsset_default"])
+    text = setup.read_text()
+    if base_mode == "missing":
+        text = text.replace("  export CMSSW_BASE=", "  unset CMSSW_BASE\n  # export CMSSW_BASE=")
+    else:
+        wrong_release = source.parent / "wrong_release"
+        (wrong_release / "src").mkdir(parents=True)
+        text = text.replace("  export CMSSW_BASE=", "  export CMSSW_BASE={}\n  # export CMSSW_BASE=".format(shlex.quote(str(wrong_release))))
+    setup.write_text(text)
+    campaign_id = invoke_native("create", source)["campaign_id"]
+    attempt_id = invoke_native("plan", campaign_id)["request"]["attempt_id"]
+    invoke_native("dispatch", campaign_id, attempt_id)
+    receipt = invoke_native("collect", campaign_id, attempt_id)["receipts"][0]
+    result = read_json(receipt["references"][2]["resolved_path"])
+    assert result["status"] == "runtime_unresolved"
+    assert result["exit_code"] != 0
+    assert "configured release" in Path(result["stderr"]).read_text()
+    assert receipt["status"] == "invalid"
+    assert receipt["reference_group"] is None
+    assert invoke_native("status", campaign_id)["points"][3]["status"] == "invalid"
+
+
+def test_native_local_rejects_foreign_combine_before_execution(native_inputs, invoke_native):
+    source, _, _, _ = native_inputs
+    setup = Path(yaml.safe_load(source.read_text())["local_runtime"]["cmsset_default"])
+    foreign_bin = source.parent / "foreign_bin"
+    foreign_bin.mkdir()
+    foreign_combine = foreign_bin / "combine"
+    foreign_combine.write_text("#!/bin/sh\nexit 0\n")
+    foreign_combine.chmod(0o700)
+    release_bin = source.parent / "release" / "bin" / "synthetic_arch"
+    setup.write_text(setup.read_text().replace(
+        "export PATH={}:$PATH".format(shlex.quote(str(release_bin))),
+        "export PATH={}:$PATH".format(shlex.quote(str(foreign_bin)))))
+    campaign_id = invoke_native("create", source)["campaign_id"]
+    attempt_id = invoke_native("plan", campaign_id)["request"]["attempt_id"]
+    invoke_native("dispatch", campaign_id, attempt_id)
+    receipt = invoke_native("collect", campaign_id, attempt_id)["receipts"][0]
+    result = read_json(receipt["references"][2]["resolved_path"])
+    assert result["status"] == "runtime_unresolved"
+    assert result["exit_code"] != 0
+    assert result.get("resolved_runtime") is None
+    assert "configured release" in Path(result["stderr"]).read_text()
+    assert receipt["status"] == "invalid" and receipt["reference_group"] is None
+
+
+def test_native_local_publication_error_after_zero_exit(native_inputs, invoke_native, monkeypatch):
+    source, root, _, _ = native_inputs
+    campaign_id = invoke_native("create", source)["campaign_id"]
+    planned = invoke_native("plan", campaign_id)
+    attempt_id = planned["request"]["attempt_id"]
+    member = planned["plan"]["jobs"][0]["expected_members"][0]
+    destination = Path(planned["plan"]["jobs"][0]["execution_provenance"]["execution_directory"]) / member["file_name"]
+    with monkeypatch.context() as patch:
+        original_link = campaign_backend.os.link
+        def fail_publication(*args, **kwargs):
+            if Path(args[1]) == destination:
+                raise OSError(28, "synthetic no space")
+            return original_link(*args, **kwargs)
+        patch.setattr(campaign_backend.os, "link", fail_publication)
+        invoke_native("dispatch", campaign_id, attempt_id)
+    receipt = invoke_native("collect", campaign_id, attempt_id)["receipts"][0]
+    result = read_json(receipt["references"][2]["resolved_path"])
+    assert result["status"] == "publication_failed" and result["exit_code"] == 0
+    assert "synthetic no space" in result["error"]
+    assert not destination.exists()
+    assert receipt["status"] == "invalid" and "publication_failed" in receipt["reason"]
+    assert receipt["reference_group"] is None
+    assert invoke_native("status", campaign_id)["points"][3]["status"] == "invalid"
 
 
 @pytest.mark.parametrize("tamper", ["manifest", "member"])

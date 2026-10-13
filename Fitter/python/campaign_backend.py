@@ -205,16 +205,21 @@ class local_plan_backend(condor_plan_backend):
                     "command_argv": argv, "runtime": runtime,
                     "started_utc": datetime.now(timezone.utc).isoformat()})
                 worker_script = ("set -euo pipefail -C\n"
-                    "ulimit -s unlimited\n"
-                    "source \"$1\"\n"
                     "export SCRAM_ARCH=\"$2\"\n"
+                    "set +u\n"
+                    "source \"$1\"\n"
                     "cd \"$3\"\n"
-                    "runtime_exports=\"$(scram runtime -sh)\"\n"
-                    "test -n \"$runtime_exports\"\n"
-                    "eval \"$runtime_exports\"\n"
-                    "resolved_combine=\"$(command -v combine)\"\n"
-                    "test -n \"$resolved_combine\"\n"
+                    "cmsenv\n"
+                    "set -u\n"
+                    "ulimit -s unlimited\n"
+                    "ulimit -c 0\n"
+                    "hash -r\n"
+                    "resolved_combine=\"$(command -v combine || true)\"\n"
                     "printf '%s\\n' \"SCRAM_ARCH=$SCRAM_ARCH\" \"CMSSW_BASE=${CMSSW_BASE-}\" \"combine_executable=$resolved_combine\" \"stack=$(ulimit -s)\" > \"$5\"\n"
+                    "if [[ -z \"${CMSSW_BASE-}\" || \"$CMSSW_BASE\" != /* || ! -d \"$CMSSW_BASE/src\" || \"$(cd -- \"$CMSSW_BASE/src\" && pwd -P)\" != \"$(pwd -P)\" || \"$SCRAM_ARCH\" != \"$2\" || \"$resolved_combine\" != /* || ! -x \"$resolved_combine\" || ! -x \"$CMSSW_BASE/bin/$2/combine\" || \"$(readlink -f -- \"$resolved_combine\")\" != \"$(readlink -f -- \"$CMSSW_BASE/bin/$2/combine\")\" ]]; then\n"
+                    "  printf 'local CMSSW runtime does not match configured release, architecture, or Combine executable\\n' >&2\n"
+                    "  exit 1\n"
+                    "fi\n"
                     "cd \"$4\"\n"
                     "shift 5\n"
                     "exec \"$@\"\n")
@@ -238,7 +243,7 @@ class local_plan_backend(condor_plan_backend):
                             env=worker_environment, stdout=stdout, stderr=stderr, check=False)
                     outcome["exit_code"] = completed.returncode
                     outcome["status"] = "completed" if completed.returncode == 0 else "nonzero"
-                    if completed.returncode == 0:
+                    if completed.returncode == 0 or resolution_path.is_file():
                         try:
                             resolved_runtime = dict(line.split("=", 1) for line in
                                 resolution_path.read_text(encoding="utf-8").splitlines())
@@ -247,7 +252,14 @@ class local_plan_backend(condor_plan_backend):
                         if (set(resolved_runtime) != {"SCRAM_ARCH", "CMSSW_BASE", "combine_executable", "stack"} or
                                 resolved_runtime["SCRAM_ARCH"] != runtime["scram_arch"] or
                                 resolved_runtime["stack"] != "unlimited" or
-                                not resolved_runtime["combine_executable"].startswith("/")):
+                                not resolved_runtime["CMSSW_BASE"] or
+                                not Path(resolved_runtime["CMSSW_BASE"]).is_absolute() or
+                                (Path(resolved_runtime["CMSSW_BASE"]) / "src").resolve() != Path(runtime["release_src"]).resolve() or
+                                not Path(resolved_runtime["combine_executable"]).is_absolute() or
+                                not os.access(resolved_runtime["combine_executable"], os.X_OK) or
+                                Path(resolved_runtime["combine_executable"]).resolve() !=
+                                (Path(resolved_runtime["CMSSW_BASE"]) / "bin" /
+                                 runtime["scram_arch"] / "combine").resolve()):
                             outcome["status"] = "runtime_unresolved"
                         else:
                             outcome["resolved_runtime"] = resolved_runtime
@@ -261,6 +273,9 @@ class local_plan_backend(condor_plan_backend):
                                 os.link(worker_output, destination, follow_symlinks=False)
                             except FileExistsError:
                                 outcome["status"] = "collision"
+                            except OSError as error:
+                                outcome["status"] = "publication_failed"
+                                outcome["error"] = str(error)
                 except OSError as error:
                     outcome["error"] = str(error)
                 outcome["finished_utc"] = datetime.now(timezone.utc).isoformat()
@@ -316,11 +331,13 @@ class local_plan_backend(condor_plan_backend):
                     result["job_set_id"] != link["job_set_id"] or
                     result["member"] != item["member"] or
                     result["command_argv"] != manifest["command_argvs"][item["member"]["member_index"]] or
-                    result["status"] not in ("completed", "nonzero", "launch_failed", "collision", "unsafe_output", "runtime_unresolved") or
+                    result["status"] not in ("completed", "nonzero", "launch_failed", "collision", "unsafe_output", "runtime_unresolved", "publication_failed") or
                     (result["status"] == "completed" and (result["exit_code"] != 0 or
                         not isinstance(result.get("resolved_runtime"), dict))) or
                     (result["status"] == "nonzero" and (type(result["exit_code"]) is not int or result["exit_code"] == 0)) or
-                    (result["status"] in ("collision", "unsafe_output", "runtime_unresolved") and result["exit_code"] != 0)):
+                    (result["status"] == "runtime_unresolved" and type(result["exit_code"]) is not int) or
+                    (result["status"] in ("collision", "unsafe_output", "publication_failed") and result["exit_code"] != 0) or
+                    (result["status"] == "publication_failed" and not result.get("error"))):
                 raise RuntimeError("unknown local worker state: outcome identity invalid")
             item["worker_status"] = result["status"]
             item["worker_exit_code"] = result["exit_code"]

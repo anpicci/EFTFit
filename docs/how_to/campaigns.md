@@ -48,13 +48,19 @@ qualification remain prerequisites to future real execution.
 `local_runtime` is optional for planning and required for local dispatch. It
 contains typed setup-script, architecture, and release-source bindings;
 arbitrary shell commands are not accepted. The worker starts non-login Bash
-with a small environment allowlist, sets an unlimited stack, sources the
-selected setup file, resolves `scram runtime -sh` under the selected
-`SCRAM_ARCH`, and executes the planner's exact `combine` argv. Controller
+with a small environment allowlist. It exports the selected `SCRAM_ARCH`,
+sources the selected setup file with Bash nounset temporarily disabled, enters
+the configured release `src`, calls `cmsenv`, restores nounset, sets an unlimited
+stack and disables core dumps. It then resolves `combine`, checks that
+`CMSSW_BASE/src` matches the configured release and that the executable is the
+active release's architecture-specific binary, and executes the planner's exact
+`combine` argv. Controller
 `PYTHONPATH`, Conda variables, and `LD_LIBRARY_PATH` are excluded. Dispatch
 records the setup file identity; the worker outcome records the resolved
-`combine` path, architecture, CMSSW base and stack. Runtime settings do not
-enter the scientific job-set identity.
+`combine` path, architecture, CMSSW base and stack. Resolution and binding
+checks establish setup and binary lookup; only the worker exit and output show
+whether Combine ran successfully. Runtime settings do not enter the scientific
+job-set identity.
 
 For runtime Asimov generation, use `dataset: {mode: expected, truth: sm}`.
 The frozen effective spec records `nuisance_generation: nominal`; the plan
@@ -190,7 +196,9 @@ interruption or missing completion evidence leaves an unknown intent that is
 never automatically resubmitted. Each worker has a private directory,
 stdout/stderr, start and outcome records, and a typed 009A manifest/attempt
 record. Successful worker output is linked exclusively to the exact expected
-member name. Nonzero exit, missing output and invalid ROOT are classified
+member name. A non-collision link error is recorded as `publication_failed`
+with its error and process exit code; collection does not accept that member.
+Nonzero exit, missing output and invalid ROOT are classified
 separately. Collection is read-only at the provider boundary; the campaign
 then commits one atomic batch of scientific receipts. Duplicate dispatch or
 collection is rejected. Condor dispatch and collection remain unavailable.
