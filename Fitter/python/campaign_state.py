@@ -47,7 +47,7 @@ class campaign_store:
     @contextmanager
     def locked(self):
         # Lock the immutable identity file: status/dry-run never create locks.
-        with (self.path / "campaign.json").open("rb") as stream:
+        with (self.path / "campaign.json").open("r+b") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             try:
                 yield

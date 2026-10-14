@@ -1,11 +1,14 @@
 """Local synthetic lifecycle/transaction tests; never execute Combine or submit."""
 
 import importlib.util
+import fcntl
 import io
 import json
 import multiprocessing
 import os
+import queue
 import shlex
+import stat
 import subprocess
 from pathlib import Path
 import sys
@@ -178,6 +181,90 @@ def concurrent_restart(root, campaign_id, revision, queue):
     with redirect_stdout(output), redirect_stderr(errors):
         code = campaign_cli().main(["--root", str(root), "restart", campaign_id, "--expected-revision", str(revision)])
     queue.put(json.loads(output.getvalue())["active_generation_id"] if code == 0 else json.loads(errors.getvalue())["error"])
+
+
+def enter_store_lock(root, campaign_id, signals, messages):
+    messages.put("ready")
+    signals.get(timeout=5)
+    messages.put("attempting")
+    with state.campaign_store(root, campaign_id).locked():
+        messages.put("entered")
+
+
+def test_store_exclusive_lock_preserves_identity_and_read_only_status(campaign_inputs, monkeypatch):
+    source, _, root = campaign_inputs
+    created = manager.create(root, source)
+    campaign_id = created["campaign_id"]
+    store = state.campaign_store(root, campaign_id)
+    identity = store.path / "campaign.json"
+    before = (identity.read_bytes(), identity.stat().st_ino, stat.S_IMODE(identity.stat().st_mode))
+    observed_access = []
+    observed_unlocks = []
+    original_flock = fcntl.flock
+
+    def observe_flock(descriptor, operation):
+        if operation == fcntl.LOCK_EX:
+            observed_access.append(fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE)
+        elif operation == fcntl.LOCK_UN:
+            observed_unlocks.append(descriptor)
+        return original_flock(descriptor, operation)
+
+    monkeypatch.setattr(state.fcntl, "flock", observe_flock)
+    with store.locked():
+        assert store.read()["revision"] == 1
+    with pytest.raises(RuntimeError, match="deliberate exit"):
+        with store.locked():
+            raise RuntimeError("deliberate exit")
+    assert observed_access == [os.O_RDWR, os.O_RDWR]
+    assert len(observed_unlocks) == 2
+    assert (identity.read_bytes(), identity.stat().st_ino, stat.S_IMODE(identity.stat().st_mode)) == before
+    assert (store.path / "event_00000001.commit.json").exists()
+    assert not store.read()["incomplete"]
+
+    identity.chmod(0o400)
+    try:
+        assert manager.status(root, campaign_id)["campaign_id"] == campaign_id
+        with pytest.raises(PermissionError):
+            with store.locked():
+                pytest.fail("unwritable identity entered the writer section")
+    finally:
+        identity.chmod(before[2])
+    assert identity.read_bytes() == before[0]
+    with pytest.raises(FileExistsError):
+        store.create({"conflicting": True}, "different source", [])
+    assert (identity.read_bytes(), identity.stat().st_ino, stat.S_IMODE(identity.stat().st_mode)) == before
+
+
+def test_store_exclusive_lock_serializes_processes_and_releases(campaign_inputs):
+    source, _, root = campaign_inputs
+    campaign_id = manager.create(root, source)["campaign_id"]
+    store = state.campaign_store(root, campaign_id)
+    context = multiprocessing.get_context("fork")
+    signals = context.Queue()
+    messages = context.Queue()
+    worker = context.Process(target=enter_store_lock, args=(root, campaign_id, signals, messages))
+    try:
+        worker.start()
+        assert messages.get(timeout=5) == "ready"
+        with store.locked():
+            signals.put("go")
+            assert messages.get(timeout=5) == "attempting"
+            with pytest.raises(queue.Empty):
+                messages.get(timeout=0.3)
+        assert messages.get(timeout=5) == "entered"
+        worker.join(5)
+        assert worker.exitcode == 0
+        with pytest.raises(RuntimeError, match="deliberate exit"):
+            with store.locked():
+                raise RuntimeError("deliberate exit")
+        with store.locked():
+            assert store.read()["revision"] == 1
+    finally:
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(5)
+        signals.close()
+        messages.close()
 
 
 def test_crash_exposed_without_pointer_promotion(campaign_inputs, record_property):
