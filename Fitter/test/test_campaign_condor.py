@@ -11,6 +11,8 @@ import yaml
 from test_campaign_cli import native_inputs, cli
 from test_campaign_manager import campaign_inputs
 from python import campaign_condor
+from python.campaign_backend import condor_plan_backend, local_plan_backend
+from python.campaign_spec import digest, load_spec
 from python.campaign_state import campaign_store
 from python.execution_provenance import read_json, sha256_file, write_json_exclusive
 
@@ -107,6 +109,10 @@ def test_public_condor_bridge_accepts_valid_member(condor_case, monkeypatch):
     assert job["command_argvs"][0][job["command_argvs"][0].index("--points") + 1] == "5"
     assert job["command_argvs"][0][job["command_argvs"][0].index("-n") + 1].endswith("POINTS.3.3")
     assert len(calls["submit"]) == 1 and calls["submit"][0][1] == 1
+    assert calls["submit"][0][2].count("request_memory = 4096M\n") == 1
+    assert calls["submit"][0][2].count("request_memory = ") == 1
+    assert "request_memory = 10000" not in calls["submit"][0][2]
+    assert invoke("status", campaign_id)["attempts"][0]["runtime"]["request_memory_mb"] == 4096
     assert "arguments = $(member_index) $(ClusterId) $(ProcId)" in calls["submit"][0][2]
     worker_exit, worker_calls, work_directory = execute_synthetic_worker(condor_case, job, attempt_id, monkeypatch)
     assert worker_exit == 0 and len(worker_calls) == 1
@@ -123,6 +129,77 @@ def test_public_condor_bridge_accepts_valid_member(condor_case, monkeypatch):
     assert invoke("status", campaign_id)["points"][3]["status"] == "accepted"
     assert "already dispatched" in invoke("dispatch", campaign_id, attempt_id, expected=2)["error"]
     assert len(calls["submit"]) == 1
+
+
+@pytest.mark.parametrize("memory", [0, -1, True, "8192", 262145])
+def test_condor_memory_schema_rejects_invalid_values(condor_case, memory):
+    source, _, _, invoke = condor_case
+    data = yaml.safe_load(source.read_text())
+    data["condor_runtime"]["request_memory_mb"] = memory
+    source.write_text(yaml.safe_dump(data))
+    assert "request_memory_mb" in invoke("create", source, expected=2)["error"]
+
+
+def test_condor_memory_override_and_scientific_identity(condor_case):
+    source, _, calls, invoke = condor_case
+    default_spec, _ = load_spec(source)
+    assert default_spec["condor_runtime"]["request_memory_mb"] == 4096
+    legacy_spec = dict(default_spec, condor_runtime={
+        key: value for key, value in default_spec["condor_runtime"].items()
+        if key != "request_memory_mb"})
+    assert condor_plan_backend().runtime(legacy_spec)["request_memory_mb"] == 4096
+    local_spec = dict(default_spec, local_runtime=legacy_spec["condor_runtime"])
+    assert "request_memory_mb" not in local_plan_backend().runtime(local_spec)
+    campaign_id = invoke("create", source)["campaign_id"]
+    first = invoke("plan", campaign_id)
+    request = first["request"]
+    default_job = first["plan"]["jobs"][0]
+    data = yaml.safe_load(source.read_text())
+    data["condor_runtime"]["request_memory_mb"] = 8192
+    source.write_text(yaml.safe_dump(data))
+    override_spec, _ = load_spec(source)
+    assert override_spec["condor_runtime"]["request_memory_mb"] == 8192
+    override_job = condor_plan_backend().plan(request, override_spec)["jobs"][0]
+    assert condor_plan_backend().plan(request, legacy_spec)["jobs"][0]["condor"][
+        "submit_description"].count("request_memory = 4096M\n") == 1
+    assert digest({k: v for k, v in default_spec.items() if k != "condor_runtime"}) == digest(
+        {k: v for k, v in override_spec.items() if k != "condor_runtime"})
+    for key in ("job_set_id", "scan_name", "point_indices", "expected_members", "command_argvs"):
+        assert default_job[key] == override_job[key]
+    assert default_job["point_indices"] == [3]
+    assert default_job["expected_members"][0]["first_point"] == 3
+    assert default_job["expected_members"][0]["last_point"] == 3
+    assert default_job["command_argvs"][0][default_job["command_argvs"][0].index("--points") + 1] == "5"
+    assert override_job["condor"]["submit_description"].count("request_memory = 8192M\n") == 1
+    assert default_job["condor"]["submit_description"].count("request_memory = 4096M\n") == 1
+    # A second synthetic campaign proves the override reaches public dispatch.
+    override_campaign = invoke("create", source)["campaign_id"]
+    override_attempt = invoke("plan", override_campaign)["request"]["attempt_id"]
+    invoke("dispatch", override_campaign, override_attempt)
+    assert calls["submit"][0][2].count("request_memory = 8192M\n") == 1
+    assert calls["submit"][0][2].count("request_memory = ") == 1
+    assert invoke("status", override_campaign)["attempts"][0]["runtime"]["request_memory_mb"] == 8192
+
+
+def test_terminal_removed_condor_retries_same_member_with_default_memory(condor_case, monkeypatch):
+    campaign_id, attempt_id, job, calls, invoke, _ = prepared(condor_case)
+    old_response = Path(job["execution_provenance"]["scheduler_directory"]) / (
+        "campaign_" + attempt_id) / "submission_response.json"
+    old_response_bytes = old_response.read_bytes()
+    monkeypatch.setattr(campaign_condor, "query_job", lambda cluster, proc: {
+        "ClusterId": cluster, "ProcId": proc, "JobStatus": 3})
+    receipt = invoke("collect", campaign_id, attempt_id)["receipts"][0]
+    assert receipt["status"] == "invalid" and "scheduler_failed" in receipt["reason"]
+    retry = invoke("retry", campaign_id, "--backend", "condor", "--scan-id", "ctG:profiled")
+    new_attempt = retry["request"]["attempt_id"]
+    assert new_attempt != attempt_id
+    assert retry["plan"]["jobs"][0]["job_set_id"] == job["job_set_id"]
+    assert retry["plan"]["jobs"][0]["command_argvs"] == job["command_argvs"]
+    invoke("dispatch", campaign_id, new_attempt)
+    assert len(calls["submit"]) == 2
+    assert calls["submit"][1][2].count("request_memory = 4096M\n") == 1
+    assert old_response.read_bytes() == old_response_bytes
+    assert invoke("status", campaign_id)["attempts"][-1]["runtime"]["request_memory_mb"] == 4096
 
 
 def test_worker_collision_preserves_foreign_output(condor_case, monkeypatch):

@@ -15,7 +15,8 @@ from .execution_provenance import (build_direct_attempt_record, build_direct_gri
                                    validate_direct_attempt_record, validate_direct_grid_provenance,
                                    write_json_exclusive)
 from .wc_fit_config import build_configured_grid_scan_command
-from .campaign_spec import digest, fit_config, planned_points
+from .campaign_spec import (default_condor_request_memory_mb, digest, fit_config,
+                            planned_points)
 
 
 def runtime_identity():
@@ -44,7 +45,7 @@ def grid_argv(spec, point, strategy):
     return args
 
 
-def _render_condor(provenance, attempt_id):
+def _render_condor(provenance, attempt_id, request_memory_mb):
     """Render literal argv into a bounded shell dispatcher and exact queue."""
     attempt_directory = os.path.join(provenance["scheduler_directory"], "campaign_" + attempt_id)
     if not re.fullmatch(r"/[A-Za-z0-9_./-]+", attempt_directory):
@@ -70,6 +71,7 @@ def _render_condor(provenance, attempt_id):
                       "    ;;\n"])
     lines.extend(["  *) exit 2 ;;\n", "esac\n"])
     submit = ["universe = vanilla\n", "should_transfer_files = NO\n",
+              "request_memory = {}M\n".format(request_memory_mb),
               "executable = {}\n".format(script_path),
               "arguments = $(member_index)\n", "initialdir = $(work_directory)\n",
               "output = $(work_directory)/stdout.txt\n",
@@ -133,7 +135,9 @@ class condor_plan_backend:
                        "member_{:04d}".format(member["member_index"]))
                        for member in provenance["expected_members"]]}
             if self.name == "condor":
-                job["condor"] = _render_condor(provenance, request["attempt_id"])
+                memory = spec.get("condor_runtime", {}).get(
+                    "request_memory_mb", default_condor_request_memory_mb)
+                job["condor"] = _render_condor(provenance, request["attempt_id"], memory)
             jobs.append(job)
         if len({job["job_set_id"] for job in jobs}) != len(jobs):
             raise ValueError("cross-scan job identity collision")
@@ -151,7 +155,8 @@ class condor_plan_backend:
         return dict(runtime_identity(), provider=self.name,
                     execution_environment="clean_nonlogin_cmssw_shared_filesystem",
                     cmsset_default=file_identity(cmsset),
-                    release_src=str(release_src.resolve()), scram_arch=binding["scram_arch"])
+                    release_src=str(release_src.resolve()), scram_arch=binding["scram_arch"],
+                    request_memory_mb=binding.get("request_memory_mb", default_condor_request_memory_mb))
 
     def dispatch(self, attempt, spec, namespace, recover=False):
         namespace = Path(namespace)
@@ -241,6 +246,9 @@ class condor_plan_backend:
                     stream.write(worker_text)
                 worker_path.chmod(0o700)
             projected_submit = job["condor"]["submit_description"]
+            if projected_submit.count("request_memory = {}M\n".format(runtime["request_memory_mb"])) != 1 or sum(
+                    line.startswith("request_memory") for line in projected_submit.splitlines()) != 1:
+                raise ValueError("Condor submit memory request differs from dispatch runtime")
             if any(projected_submit.count(fragment) != 1 for fragment in (
                     "arguments = $(member_index)\n", "output = $(work_directory)/stdout.txt\n",
                     "error = $(work_directory)/stderr.txt\n")):

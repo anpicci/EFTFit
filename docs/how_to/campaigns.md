@@ -39,6 +39,7 @@ backend: condor       # optional default for new execution plans
 #   cmsset_default: /path/to/cmsset_default.sh
 #   scram_arch: <supported SCRAM_ARCH>
 #   release_src: /path/to/CMSSW/src
+#   request_memory_mb: 4096  # optional; effective Condor default is 4096 MiB
 keep_failures: false
 ```
 
@@ -68,14 +69,20 @@ whether Combine ran successfully. Runtime settings do not enter the scientific
 job-set identity.
 
 `condor_runtime` uses the same typed release bindings for Condor dispatch.
+Its optional positive integer `request_memory_mb` defaults to 4096 MiB and
+renders one explicit `request_memory = 4096M` submit request (or the configured
+value). The effective request is bound to the dispatch runtime; it changes no
+scientific argv or direct-grid job-set identity. The campaign's stored
+`spec_digest` still protects the entire frozen effective specification, so it
+does change when a newly created campaign specifies a different memory value.
 The controller, submit host and workers must share readable source, setup,
 release, workspace, and attempt paths and writable attempt/result storage.
 The worker uses `/usr/bin/python3` for its standard-library adapter, then a
 clean non-login CMSSW Bash for the planned `combine` argv. Condor does not
 transfer inputs in this provider. Controller readability alone does not prove
 worker access; deployment paths, admission and resources require a separate
-real preparation check. No CPU, memory or disk request is inferred from the
-synthetic examples.
+real preparation check. No CPU or disk request is inferred from the synthetic
+examples.
 
 For runtime Asimov generation, use `dataset: {mode: expected, truth: sm}`.
 The frozen effective spec records `nuisance_generation: nominal`; the plan

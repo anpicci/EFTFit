@@ -13,6 +13,9 @@ from .execution_provenance import (canonical_json_bytes, file_identity, workspac
 from .inference_recipe import normalize_inference_recipe, bind_inference_invocation
 from .wc_fit_config import load_fit_input_package, load_fit_config, resolve_scan_wcs, WCFitConfig
 
+default_condor_request_memory_mb = 4096
+max_condor_request_memory_mb = 262144
+
 
 def digest(value):
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
@@ -118,11 +121,17 @@ def load_spec(path):
         binding = data.get(runtime_name)
         if binding is None:
             continue
-        fields(binding, {"cmsset_default", "scram_arch", "release_src"})
+        fields(binding, {"cmsset_default", "scram_arch", "release_src"},
+               {"request_memory_mb"} if runtime_name == "condor_runtime" else ())
         if not isinstance(binding["scram_arch"], str) or not re.fullmatch(
                 r"[A-Za-z0-9_]+", binding["scram_arch"]):
             raise ValueError(runtime_name + ".scram_arch must be a simple architecture name")
         binding = dict(binding)
+        if runtime_name == "condor_runtime":
+            memory = binding.get("request_memory_mb", default_condor_request_memory_mb)
+            if type(memory) is not int or not 1 <= memory <= max_condor_request_memory_mb:
+                raise ValueError("condor_runtime.request_memory_mb must be a positive integer <= 262144 MiB")
+            binding["request_memory_mb"] = memory
         for key in ("cmsset_default", "release_src"):
             if not isinstance(binding[key], str) or not binding[key]:
                 raise ValueError(runtime_name + " paths must be nonempty strings")
