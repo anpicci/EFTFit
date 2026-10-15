@@ -15,22 +15,32 @@ except ImportError:  # Direct worker script in the same package directory.
                                       validate_direct_grid_provenance, write_json_exclusive)
 
 
+class submission_not_started(RuntimeError):
+    """The submit executable never started, so this invocation created no job."""
+
+
 def submit_job(submit_path, member_count):
     """Return actual cluster/proc identities; a lost response is ambiguous."""
     try:
-        completed = subprocess.run(["condor_submit", "-terse", str(submit_path)],
-                                   cwd=submit_path.parent, capture_output=True, text=True,
-                                   check=False, timeout=60)
-    except FileNotFoundError as error:
-        raise RuntimeError("Condor submission did not start: executable absent") from error
+        process = subprocess.Popen(["condor_submit", "-terse", str(submit_path)],
+                                   cwd=submit_path.parent, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+    except OSError as error:
+        raise submission_not_started("Condor submission did not start") from error
+    try:
+        stdout, stderr = process.communicate(timeout=60)
+    except subprocess.TimeoutExpired as error:
+        process.kill()
+        process.communicate()
+        raise RuntimeError("Condor submission outcome uncertain after timeout") from error
     except (OSError, subprocess.SubprocessError) as error:
         raise RuntimeError("Condor submission outcome uncertain after invocation") from error
     response = {"argv": ["condor_submit", "-terse", str(submit_path)],
-                "returncode": completed.returncode, "stdout": completed.stdout,
-                "stderr": completed.stderr}
-    if completed.returncode != 0:
+                "returncode": process.returncode, "stdout": stdout,
+                "stderr": stderr}
+    if process.returncode != 0:
         raise RuntimeError("Condor submission outcome uncertain: " + repr(response))
-    cluster_id, proc_ids = parse_submit_response(completed.stdout, member_count)
+    cluster_id, proc_ids = parse_submit_response(stdout, member_count)
     return dict(response, cluster_id=cluster_id, proc_ids=proc_ids)
 
 

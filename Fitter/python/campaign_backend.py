@@ -87,7 +87,7 @@ class condor_plan_backend:
     name = "condor"
     capabilities = {"plan": True, "dispatch": True, "collect": True}
 
-    def plan(self, request, spec):
+    def plan(self, request, spec, allow_existing=False):
         expected = {(point["scan_id"], point["point_index"]): point
                     for point in planned_points(spec)}
         selected = {}
@@ -117,9 +117,9 @@ class condor_plan_backend:
             validate_direct_grid_provenance(provenance, scan_name)
             attempt_directory = os.path.join(provenance["scheduler_directory"],
                                              "campaign_" + request["attempt_id"])
-            if os.path.lexists(attempt_directory):
+            if not allow_existing and os.path.lexists(attempt_directory):
                 raise ValueError("execution attempt directory already exists")
-            if any(os.path.lexists(os.path.join(provenance["execution_directory"],
+            if not allow_existing and any(os.path.lexists(os.path.join(provenance["execution_directory"],
                                            member["file_name"]))
                    for member in provenance["expected_members"]):
                 raise ValueError("identity-owned member output already exists")
@@ -153,51 +153,93 @@ class condor_plan_backend:
                     cmsset_default=file_identity(cmsset),
                     release_src=str(release_src.resolve()), scram_arch=binding["scram_arch"])
 
-    def dispatch(self, attempt, spec, namespace):
+    def dispatch(self, attempt, spec, namespace, recover=False):
         namespace = Path(namespace)
         if namespace != Path(attempt["execution_root"]):
             raise ValueError("Condor attempt namespace differs from reserved execution root")
         runtime = self.runtime(spec)
         if attempt["dispatch"]["runtime"] != runtime:
             raise ValueError("Condor worker runtime changed after dispatch intent")
-        mapped = self.plan(attempt, spec)
+        mapped = self.plan(attempt, spec, allow_existing=recover)
         if [{key: job[key] for key in ("job_set_id", "scan_name", "scan_id", "point_indices",
                                    "expected_execution_attempt_id")} for job in mapped["jobs"]] != attempt["execution_links"]:
             raise ValueError("Condor execution differs from reserved 009A plan")
-        namespace.mkdir(parents=True, mode=0o700)
+        if recover:
+            for job in mapped["jobs"]:
+                provenance = job["execution_provenance"]
+                attempt_directory = Path(provenance["scheduler_directory"]) / (
+                    "campaign_" + attempt["attempt_id"])
+                if os.path.lexists(attempt_directory / "submission_response.json"):
+                    raise ValueError("proven no-submit recovery has a scheduler binding")
+                if any(os.path.lexists(Path(provenance["execution_directory"]) / member["file_name"])
+                       for member in provenance["expected_members"]):
+                    raise ValueError("proven no-submit recovery has member output")
+        else:
+            namespace.mkdir(parents=True, mode=0o700)
+        submitted = 0
         for job in mapped["jobs"]:
             provenance = validate_direct_grid_provenance(job["execution_provenance"])
             execution_directory = Path(provenance["execution_directory"])
             manifest_path = execution_directory / "execution_provenance.json"
-            write_json_exclusive(manifest_path, provenance)
-            manifest_reference = file_identity(manifest_path)
             attempt_directory = Path(provenance["scheduler_directory"]) / (
                 "campaign_" + attempt["attempt_id"])
-            attempt_directory.mkdir(parents=True, mode=0o700)
             record_path = Path(provenance["attempts_directory"]) / (
                 job["expected_execution_attempt_id"] + ".json")
+            worker_path = attempt_directory / "worker.sh"
+            payload_path = attempt_directory / "worker_payload.json"
+            submit_path = attempt_directory / "submit.sub"
+            if recover and os.path.lexists(attempt_directory):
+                if (attempt_directory.is_symlink() or read_json(manifest_path) != provenance):
+                    raise ValueError("Condor recovery manifest differs from planned execution")
+                record = read_json(record_path)
+                manifest_reference = file_identity(manifest_path)
+                validate_direct_attempt_record(provenance, record, manifest_reference["sha256"])
+                intent = read_json(attempt_directory / "submission_intent.json")
+                if (record["attempt_id"] != job["expected_execution_attempt_id"] or
+                        record["member_set"] != provenance["expected_members"] or
+                        intent != {"attempt_id": record["attempt_id"], "job_set_id": job["job_set_id"],
+                            "manifest": manifest_reference, "attempt_record": file_identity(record_path),
+                            "member_set": record["member_set"], "submit": file_identity(submit_path),
+                            "worker_script": file_identity(worker_path),
+                            "worker_payload": file_identity(payload_path)} or
+                        read_json(payload_path) != {"manifest": str(manifest_path),
+                            "record": str(record_path), "attempt_id": record["attempt_id"],
+                            "runtime": runtime}):
+                    raise ValueError("Condor recovery materialization differs from proven no-submit intent")
+            else:
+                write_json_exclusive(manifest_path, provenance)
+                manifest_reference = file_identity(manifest_path)
+                attempt_directory.mkdir(parents=True, mode=0o700)
+                record = None
             artifacts = [str(attempt_directory / name) for name in (
                 "worker.sh", "worker_payload.json", "submit.sub", "submission_intent.json", "submission_response.json")]
             for member in provenance["expected_members"]:
                 work_directory = attempt_directory / "member_{:04d}".format(member["member_index"])
-                work_directory.mkdir(mode=0o700)
+                if record is None:
+                    work_directory.mkdir(mode=0o700)
                 artifacts.extend(str(work_directory / name) for name in (
                     "worker_start.json", "worker_result.json", "runtime_resolution.txt",
                     "stdout.txt", "stderr.txt", "scheduler_stdout.txt", "scheduler_stderr.txt"))
-            record = build_direct_attempt_record(provenance,
+            expected_record = build_direct_attempt_record(provenance,
                 job["expected_execution_attempt_id"], attempt["operation"],
                 provenance["expected_members"], manifest_path, artifacts)
+            if record is not None and record != expected_record:
+                raise ValueError("Condor recovery attempt record differs from planned execution")
+            record = expected_record
             validate_direct_attempt_record(provenance, record, manifest_reference["sha256"])
-            write_json_exclusive(record_path, record)
-            worker_path = attempt_directory / "worker.sh"
-            payload_path = attempt_directory / "worker_payload.json"
-            write_json_exclusive(payload_path, {"manifest": str(manifest_path),
-                "record": str(record_path), "attempt_id": record["attempt_id"], "runtime": runtime})
+            if not recover or not os.path.lexists(record_path):
+                write_json_exclusive(record_path, record)
+                write_json_exclusive(payload_path, {"manifest": str(manifest_path),
+                    "record": str(record_path), "attempt_id": record["attempt_id"], "runtime": runtime})
             worker_text = ("#!/bin/sh\nset -eu\nexec /usr/bin/python3 {} worker {} \"$1\" \"$2\" \"$3\"\n".format(
                 shlex.quote(str(Path(campaign_condor.__file__).resolve())), shlex.quote(str(payload_path))))
-            with worker_path.open("x", encoding="utf-8") as stream:
-                stream.write(worker_text)
-            worker_path.chmod(0o700)
+            if recover and worker_path.exists():
+                if worker_path.read_text(encoding="utf-8") != worker_text:
+                    raise ValueError("Condor recovery worker differs from planned execution")
+            else:
+                with worker_path.open("x", encoding="utf-8") as stream:
+                    stream.write(worker_text)
+                worker_path.chmod(0o700)
             projected_submit = job["condor"]["submit_description"]
             if any(projected_submit.count(fragment) != 1 for fragment in (
                     "arguments = $(member_index)\n", "output = $(work_directory)/stdout.txt\n",
@@ -207,16 +249,25 @@ class condor_plan_backend:
                 "arguments = $(member_index)\n", "arguments = $(member_index) $(ClusterId) $(ProcId)\n").replace(
                 "output = $(work_directory)/stdout.txt\n", "output = $(work_directory)/scheduler_stdout.txt\n").replace(
                 "error = $(work_directory)/stderr.txt\n", "error = $(work_directory)/scheduler_stderr.txt\n")
-            submit_path = attempt_directory / "submit.sub"
-            with submit_path.open("x", encoding="utf-8") as stream:
-                stream.write(submit_text)
-            write_json_exclusive(attempt_directory / "submission_intent.json", {
-                "attempt_id": record["attempt_id"], "job_set_id": job["job_set_id"],
-                "manifest": manifest_reference, "attempt_record": file_identity(record_path),
-                "member_set": record["member_set"], "submit": file_identity(submit_path),
-                "worker_script": file_identity(worker_path), "worker_payload": file_identity(payload_path)})
+            if recover and submit_path.exists():
+                if submit_path.read_text(encoding="utf-8") != submit_text:
+                    raise ValueError("Condor recovery submit differs from planned execution")
+            else:
+                with submit_path.open("x", encoding="utf-8") as stream:
+                    stream.write(submit_text)
+                write_json_exclusive(attempt_directory / "submission_intent.json", {
+                    "attempt_id": record["attempt_id"], "job_set_id": job["job_set_id"],
+                    "manifest": manifest_reference, "attempt_record": file_identity(record_path),
+                    "member_set": record["member_set"], "submit": file_identity(submit_path),
+                    "worker_script": file_identity(worker_path), "worker_payload": file_identity(payload_path)})
             # A submission may have succeeded even if the call or response is lost.
-            response = campaign_condor.submit_job(submit_path, len(record["member_set"]))
+            try:
+                response = campaign_condor.submit_job(submit_path, len(record["member_set"]))
+            except campaign_condor.submission_not_started as error:
+                if submitted:
+                    raise RuntimeError("Condor attempt has an earlier submitted job") from error
+                raise
+            submitted += 1
             write_json_exclusive(attempt_directory / "submission_response.json", response)
 
     def collect(self, attempt, namespace):

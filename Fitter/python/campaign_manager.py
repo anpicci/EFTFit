@@ -3,6 +3,7 @@
 from pathlib import Path
 import math
 
+from . import campaign_condor
 from .campaign_backend import select_backend
 from .campaign_spec import digest, load_spec, planned_points
 from .campaign_state import campaign_store, new_id, checked_id
@@ -41,6 +42,8 @@ def planning_eligibility(operation, points, attempts, receipts, generation_id):
                       else "canonical_reference_damaged")
         elif any(a["dispatch"] and attempt_id not in collected for attempt_id, a in attempts_for_point):
             reason = "not_yet_recoverable_dispatch_intent"
+        elif any(a["proven_not_started"] for _, a in attempts_for_point):
+            reason = "dispatch_same_attempt_after_proven_no_submit"
         elif any(r["status"] == "unresolved" and r["reason"] == "PROMOTION_UNQUALIFIED_REFERENCE"
                  for r in point_receipts):
             reason = "promotion_unqualified_reference"
@@ -86,12 +89,21 @@ def current_state(snapshot):
             attempt_id = checked_id(payload["attempt_id"])
             if attempt_id in attempts or not generations or payload["generation_id"] != generations[-1]["generation_id"]:
                 raise ValueError("attempt identity/generation mismatch")
-            attempts[attempt_id] = dict(payload, dispatch=None)
+            attempts[attempt_id] = dict(payload, dispatch=None, proven_not_started=False)
         elif event["kind"] == "dispatch":
             attempt = attempts[payload["attempt_id"]]
             if attempt["dispatch"] is not None:
                 raise ValueError("duplicate dispatch")
             attempt["dispatch"] = payload
+            attempt["proven_not_started"] = False
+        elif event["kind"] == "submission_not_started":
+            attempt = attempts[payload["attempt_id"]]
+            if (attempt["actual_backend"] != "condor" or attempt["dispatch"] is None or
+                    attempt["dispatch"]["state"] != "intent" or
+                    payload["state"] != "proven_not_started"):
+                raise ValueError("invalid Condor non-start event")
+            attempt["dispatch"] = None
+            attempt["proven_not_started"] = True
         elif event["kind"] == "validation_batch":
             receipts.extend(payload["receipts"])
         else:
@@ -121,12 +133,18 @@ def status(root, campaign_id):
                 "attempt_id", "generation_id", "requested_backend", "actual_backend", "runtime", "execution_links")}
             if attempt["dispatch"]:
                 summary["runtime"] = attempt["dispatch"]["runtime"]
+            if attempt["actual_backend"] == "condor":
+                summary["submission_state"] = ("intent" if attempt["dispatch"] else
+                    "proven_not_started" if attempt["proven_not_started"] else "planned")
             result["attempts"].append(summary)
             if attempt["generation_id"] != active["generation_id"]:
                 continue
             for point in attempt["points"]:
-                points[point_key(point)].update(status="running" if attempt["dispatch"] else "planned",
-                                               reason="dispatched; no scientific receipt" if attempt["dispatch"] else "plan only")
+                points[point_key(point)].update(
+                    status="running" if attempt["dispatch"] else "planned",
+                    reason=("dispatched; no scientific receipt" if attempt["dispatch"] else
+                            "submission proven not started; dispatch same attempt to recover"
+                            if attempt["proven_not_started"] else "plan only"))
         reference_checks = {}
         for receipt in receipts:
             if receipt["generation_id"] != active["generation_id"]:
@@ -286,6 +304,7 @@ def dispatch(root, campaign_id, attempt_id, dry_run=False, backends=None):
         attempt = active_attempt(snapshot, attempt_id)
         if attempt["dispatch"]:
             raise ValueError("attempt already dispatched; no implicit resubmission")
+        recover = attempt["proven_not_started"]
         observed = status(root, campaign_id)
         selected_keys = {point_key(p) for p in attempt["points"]}
         if any(point_key(p) in selected_keys and p["status"] in ("accepted", "running") for p in observed["points"]):
@@ -302,7 +321,17 @@ def dispatch(root, campaign_id, attempt_id, dry_run=False, backends=None):
         snapshot = store.append(snapshot, "dispatch", {"attempt_id": attempt_id,
                               "runtime": provider.runtime(spec), "state": "intent"})
         attempt = active_attempt(snapshot, attempt_id)
-        provider.dispatch(attempt, spec, store.path / "execution" / attempt_id)
+        try:
+            if recover:
+                provider.dispatch(attempt, spec, store.path / "execution" / attempt_id, recover=True)
+            else:
+                provider.dispatch(attempt, spec, store.path / "execution" / attempt_id)
+        except campaign_condor.submission_not_started:
+            if attempt["actual_backend"] != "condor":
+                raise
+            store.append(snapshot, "submission_not_started", {"attempt_id": attempt_id,
+                "state": "proven_not_started"})
+            raise
         return status(root, campaign_id)
     if dry_run:
         return transition()

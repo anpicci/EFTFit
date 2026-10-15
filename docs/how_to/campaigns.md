@@ -223,6 +223,13 @@ collection is rejected. Condor dispatch records an intent before calling
 to the exact planned member set, and records the raw response. A nonzero,
 missing, malformed or lost response does not create a successful binding; a
 possible submission requires manual investigation before any new attempt.
+If `condor_submit` could not be started, an append-only `submission_not_started`
+event records that no job was created by that invocation. `status` shows the
+attempt as planned with a proven non-start, and the same public `dispatch`
+command may be run again for that attempt after the launch problem is fixed.
+It reuses and checks the original materialized member/submit evidence before
+submitting. An intent with a possible submission and no binding remains blocked
+against resubmission; missing output alone does not establish a non-start.
 Condor collection queries only bound scheduler identities. Idle, running,
 held, suspended, transferring, evicted or unknown outcomes leave the campaign
 intent uncollected. Terminal scheduler failures produce invalid member receipts.

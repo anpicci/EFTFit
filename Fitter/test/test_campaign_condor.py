@@ -11,7 +11,10 @@ import yaml
 from test_campaign_cli import native_inputs, cli
 from test_campaign_manager import campaign_inputs
 from python import campaign_condor
-from python.execution_provenance import read_json, write_json_exclusive
+from python.campaign_state import campaign_store
+from python.execution_provenance import read_json, sha256_file, write_json_exclusive
+
+real_submit_job = campaign_condor.submit_job
 
 
 @pytest.fixture
@@ -204,36 +207,146 @@ def test_wrong_scheduler_member_is_rejected(condor_case):
 
 
 def test_missing_submission_response_never_resubmits(condor_case, monkeypatch):
-    source, _, calls, invoke = condor_case
-    monkeypatch.setattr(campaign_condor, "submit_job", lambda path, count: (_ for _ in ()).throw(
-        RuntimeError("possible submission; response lost")))
+    source, root, _, invoke = condor_case
+    monkeypatch.setattr(campaign_condor, "submit_job", real_submit_job)
+    launches = []
+    class malformed_process:
+        returncode = 0
+        def communicate(self, timeout):
+            return "", ""
+    def fake_popen(argv, **kwargs):
+        launches.append(argv)
+        return malformed_process()
+    monkeypatch.setattr(campaign_condor.subprocess, "Popen", fake_popen)
     campaign_id = invoke("create", source)["campaign_id"]
-    attempt_id = invoke("plan", campaign_id)["request"]["attempt_id"]
-    assert "response lost" in invoke("dispatch", campaign_id, attempt_id, expected=2)["error"]
+    planned = invoke("plan", campaign_id)
+    attempt_id = planned["request"]["attempt_id"]
+    job = planned["plan"]["jobs"][0]
+    response_path = (Path(job["execution_provenance"]["scheduler_directory"]) /
+                     ("campaign_" + attempt_id) / "submission_response.json")
+    assert "response is incomplete" in invoke("dispatch", campaign_id, attempt_id, expected=2)["error"]
+    snapshot = campaign_store(root, campaign_id).read()
+    assert [event["kind"] for event in snapshot["events"]][-1:] == ["dispatch"]
+    observed = invoke("status", campaign_id)
+    assert observed["attempts"][0]["submission_state"] == "intent"
+    assert observed["points"][3]["status"] == "running"
+    assert not response_path.exists()
     assert "outcome uncertain" in invoke("collect", campaign_id, attempt_id, expected=2)["error"]
     assert "already dispatched" in invoke("dispatch", campaign_id, attempt_id, expected=2)["error"]
-    assert calls["submit"] == []
+    assert len(launches) == 1
+
+
+def test_public_proven_no_submit_recovers_same_attempt(condor_case, monkeypatch):
+    source, root, _, invoke = condor_case
+    monkeypatch.setattr(campaign_condor, "submit_job", real_submit_job)
+    starts = []
+    launch_allowed = {"value": False}
+    class successful_process:
+        returncode = 0
+        def communicate(self, timeout):
+            return "75142.0", ""
+    def fake_popen(argv, **kwargs):
+        if not launch_allowed["value"]:
+            raise PermissionError("synthetic pre-exec denial")
+        starts.append(argv)
+        return successful_process()
+    monkeypatch.setattr(campaign_condor.subprocess, "Popen", fake_popen)
+    campaign_id = invoke("create", source)["campaign_id"]
+    planned = invoke("plan", campaign_id)
+    attempt_id = planned["request"]["attempt_id"]
+    job = planned["plan"]["jobs"][0]
+    response_path = (Path(job["execution_provenance"]["scheduler_directory"]) /
+                     ("campaign_" + attempt_id) / "submission_response.json")
+    assert "did not start" in invoke("dispatch", campaign_id, attempt_id, expected=2)["error"]
+    before = campaign_store(root, campaign_id).read()
+    assert [event["kind"] for event in before["events"]][-2:] == ["dispatch", "submission_not_started"]
+    assert before["events"][-1]["payload"] == {"attempt_id": attempt_id, "state": "proven_not_started"}
+    assert not response_path.exists() and starts == []
+    observed = invoke("status", campaign_id)
+    assert observed["attempts"][0]["submission_state"] == "proven_not_started"
+    assert observed["points"][3]["status"] == "planned"
+    assert "proven not started" in observed["points"][3]["reason"]
+    launch_allowed["value"] = True
+    invoke("dispatch", campaign_id, attempt_id)
+    after = campaign_store(root, campaign_id).read()
+    assert after["events"][:len(before["events"])] == before["events"]
+    assert after["events"][-1]["kind"] == "dispatch"
+    assert len(starts) == 1
+    assert read_json(response_path)["cluster_id"] == 75142
+    assert read_json(response_path)["proc_ids"] == [0]
+    assert read_json(response_path.parent / "submission_intent.json")["member_set"] == job["expected_members"]
+    assert "already dispatched" in invoke("dispatch", campaign_id, attempt_id, expected=2)["error"]
+    assert len(starts) == 1
+
+
+def test_later_non_start_cannot_clear_earlier_submitted_scan(condor_case, monkeypatch):
+    source, root, _, invoke = condor_case
+    config = source.parent / "package" / "config" / "TOP_26_006.yml"
+    package = yaml.safe_load(config.read_text())
+    package["wc_population"]["scientific"].append("c_two")
+    package["wc_ranges"]["c_two"] = [-1, 1]
+    config.write_text(yaml.safe_dump(package))
+    data = yaml.safe_load(source.read_text())
+    data["package"]["sha256"] = sha256_file(config)
+    data["selection"]["wcs"].append("c_two")
+    source.write_text(yaml.safe_dump(data))
+    monkeypatch.setattr(campaign_condor, "submit_job", real_submit_job)
+    starts = []
+    class successful_process:
+        returncode = 0
+        def communicate(self, timeout):
+            return "75142.0", ""
+    def fake_popen(argv, **kwargs):
+        if starts:
+            raise PermissionError("second scan did not start")
+        starts.append(argv)
+        return successful_process()
+    monkeypatch.setattr(campaign_condor.subprocess, "Popen", fake_popen)
+    campaign_id = invoke("create", source)["campaign_id"]
+    attempt_id = invoke("plan", campaign_id)["request"]["attempt_id"]
+    assert "earlier submitted job" in invoke("dispatch", campaign_id, attempt_id, expected=2)["error"]
+    snapshot = campaign_store(root, campaign_id).read()
+    assert snapshot["events"][-1]["kind"] == "dispatch"
+    assert invoke("status", campaign_id)["attempts"][0]["submission_state"] == "intent"
+    assert "already dispatched" in invoke("dispatch", campaign_id, attempt_id, expected=2)["error"]
+    assert len(starts) == 1
 
 
 @pytest.mark.parametrize("stdout, count", [("", 1), ("75142.0", 2),
     ("75142.0 - 75142.2", 2), ("75142.1", 1), ("75142.0 - 75143.1", 2)])
 def test_submit_response_rejects_incomplete_or_foreign_range(monkeypatch, tmp_path, stdout, count):
     calls = []
-    def fake_run(argv, **kwargs):
+    class fake_process:
+        returncode = 0
+        def communicate(self, timeout):
+            return stdout, ""
+    def fake_popen(argv, **kwargs):
         calls.append(argv)
-        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
-    monkeypatch.setattr(campaign_condor.subprocess, "run", fake_run)
+        return fake_process()
+    monkeypatch.setattr(campaign_condor.subprocess, "Popen", fake_popen)
     with pytest.raises(RuntimeError, match="response|cardinality"):
         campaign_condor.submit_job(tmp_path / "submit.sub", count)
     assert calls == [["condor_submit", "-terse", str(tmp_path / "submit.sub")]]
 
 
-def test_submit_prelaunch_failure_is_distinct(monkeypatch, tmp_path):
+@pytest.mark.parametrize("error", [FileNotFoundError("missing executable"),
+    PermissionError("permission denied"), OSError("pre-exec failure")])
+def test_submit_prelaunch_failure_is_distinct(monkeypatch, tmp_path, error):
     def absent(argv, **kwargs):
-        raise FileNotFoundError("synthetic missing executable")
-    monkeypatch.setattr(campaign_condor.subprocess, "run", absent)
-    with pytest.raises(RuntimeError, match="did not start"):
+        raise error
+    monkeypatch.setattr(campaign_condor.subprocess, "Popen", absent)
+    with pytest.raises(campaign_condor.submission_not_started, match="did not start"):
         campaign_condor.submit_job(tmp_path / "submit.sub", 1)
+
+
+def test_submit_started_then_io_error_is_uncertain(monkeypatch, tmp_path):
+    class started_process:
+        def communicate(self, timeout):
+            raise OSError("synthetic lost pipe")
+    monkeypatch.setattr(campaign_condor.subprocess, "Popen", lambda *args, **kwargs: started_process())
+    with pytest.raises(RuntimeError, match="outcome uncertain after invocation") as observed:
+        campaign_condor.submit_job(tmp_path / "submit.sub", 1)
+    assert not isinstance(observed.value, campaign_condor.submission_not_started)
 
 
 def test_exact_job_query_empty_queue_and_history_remains_unknown(monkeypatch):
