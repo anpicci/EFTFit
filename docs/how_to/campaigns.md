@@ -240,6 +240,10 @@ against resubmission; missing output alone does not establish a non-start.
 Condor collection queries only bound scheduler identities. Idle, running,
 held, suspended, transferring, evicted or unknown outcomes leave the campaign
 intent uncollected. Terminal scheduler failures produce invalid member receipts.
+For each exact job, collection checks the active queue and then scheduler
+history. A successful empty response means no record in that source, as does
+JSON `[]`; only non-empty malformed JSON is a format error. Absence from both
+sources leaves the scheduler outcome unknown.
 Terminal success requires identity-bound worker evidence and still passes the
 ordinary ROOT and coordinate validator. Missing ROOT becomes a missing receipt;
 collisions and publication failures remain invalid. A terminal worker exit alone

@@ -17,6 +17,7 @@ from python.campaign_state import campaign_store
 from python.execution_provenance import read_json, sha256_file, write_json_exclusive
 
 real_submit_job = campaign_condor.submit_job
+real_query_job = campaign_condor.query_job
 
 
 @pytest.fixture
@@ -186,14 +187,27 @@ def test_terminal_removed_condor_retries_same_member_with_default_memory(condor_
     old_response = Path(job["execution_provenance"]["scheduler_directory"]) / (
         "campaign_" + attempt_id) / "submission_response.json"
     old_response_bytes = old_response.read_bytes()
-    monkeypatch.setattr(campaign_condor, "query_job", lambda cluster, proc: {
-        "ClusterId": cluster, "ProcId": proc, "JobStatus": 3})
+    scheduler_calls = []
+    def fake_run(argv, **kwargs):
+        scheduler_calls.append(argv)
+        stdout = "" if argv[0] == "condor_q" else json.dumps([{
+            "ClusterId": 75142, "ProcId": 0, "JobStatus": 3,
+            "RemoveReason": "via condor_rm (by user apiccine)"}])
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+    monkeypatch.setattr(campaign_condor, "query_job", real_query_job)
+    monkeypatch.setattr(campaign_condor.subprocess, "run", fake_run)
     receipt = invoke("collect", campaign_id, attempt_id)["receipts"][0]
     assert receipt["status"] == "invalid" and "scheduler_failed" in receipt["reason"]
+    assert scheduler_calls == [["condor_q", "-json", "75142.0"],
+                               ["condor_history", "-json", "75142.0"]]
+    assert invoke("status", campaign_id)["points"][3]["status"] == "invalid"
     retry = invoke("retry", campaign_id, "--backend", "condor", "--scan-id", "ctG:profiled")
     new_attempt = retry["request"]["attempt_id"]
     assert new_attempt != attempt_id
     assert retry["plan"]["jobs"][0]["job_set_id"] == job["job_set_id"]
+    assert retry["plan"]["jobs"][0]["point_indices"] == [3]
+    assert [(member["first_point"], member["last_point"]) for member in
+            retry["plan"]["jobs"][0]["expected_members"]] == [(3, 3)]
     assert retry["plan"]["jobs"][0]["command_argvs"] == job["command_argvs"]
     invoke("dispatch", campaign_id, new_attempt)
     assert len(calls["submit"]) == 2
@@ -426,16 +440,96 @@ def test_submit_started_then_io_error_is_uncertain(monkeypatch, tmp_path):
     assert not isinstance(observed.value, campaign_condor.submission_not_started)
 
 
-def test_exact_job_query_empty_queue_and_history_remains_unknown(monkeypatch):
+@pytest.mark.parametrize("queue_stdout", ["", " \n\t", "[]"])
+def test_exact_job_query_empty_queue_falls_back_to_history(monkeypatch, queue_stdout):
     calls = []
     def fake_run(argv, **kwargs):
         calls.append(argv)
-        return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+        stdout = queue_stdout if argv[0] == "condor_q" else json.dumps([{
+            "ClusterId": 75142, "ProcId": 0, "JobStatus": 3,
+            "RemoveReason": "via condor_rm (by user apiccine)"}])
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+    monkeypatch.setattr(campaign_condor.subprocess, "run", fake_run)
+    row = campaign_condor.query_job(75142, 0)
+    assert row["JobStatus"] == 3 and "condor_rm" in row["RemoveReason"]
+    assert calls == [["condor_q", "-json", "75142.0"],
+                     ["condor_history", "-json", "75142.0"]]
+
+
+def test_exact_job_query_active_row_needs_no_history(monkeypatch):
+    calls = []
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout=json.dumps([{
+            "ClusterId": 75142, "ProcId": 0, "JobStatus": 2}]), stderr="")
+    monkeypatch.setattr(campaign_condor.subprocess, "run", fake_run)
+    assert campaign_condor.query_job(75142, 0)["JobStatus"] == 2
+    assert calls == [["condor_q", "-json", "75142.0"]]
+
+
+@pytest.mark.parametrize("queue_stdout", ["", "[]"])
+@pytest.mark.parametrize("history_stdout", ["", " \n", "[]"])
+def test_exact_job_query_absent_from_both_sources_remains_unknown(
+        monkeypatch, queue_stdout, history_stdout):
+    calls = []
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        stdout = queue_stdout if argv[0] == "condor_q" else history_stdout
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
     monkeypatch.setattr(campaign_condor.subprocess, "run", fake_run)
     with pytest.raises(RuntimeError, match="outcome unknown"):
         campaign_condor.query_job(75142, 0)
     assert calls == [["condor_q", "-json", "75142.0"],
                      ["condor_history", "-json", "75142.0"]]
+
+
+@pytest.mark.parametrize("stdout", ["not-json", "{"])
+@pytest.mark.parametrize("malformed_source", ["condor_q", "condor_history"])
+def test_exact_job_query_nonempty_malformed_json_fails_closed(
+        monkeypatch, stdout, malformed_source):
+    calls = []
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        response = stdout if argv[0] == malformed_source else "[]"
+        return SimpleNamespace(returncode=0, stdout=response, stderr="")
+    monkeypatch.setattr(campaign_condor.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="malformed JSON"):
+        campaign_condor.query_job(75142, 0)
+    expected = [["condor_q", "-json", "75142.0"]]
+    if malformed_source == "condor_history":
+        expected.append(["condor_history", "-json", "75142.0"])
+    assert calls == expected
+
+
+def test_exact_job_query_nonzero_exit_does_not_fall_back(monkeypatch):
+    calls = []
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=1, stdout="", stderr="synthetic failure")
+    monkeypatch.setattr(campaign_condor.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="condor_q query failed"):
+        campaign_condor.query_job(75142, 0)
+    assert calls == [["condor_q", "-json", "75142.0"]]
+
+
+def test_exact_job_query_subprocess_failure_remains_unknown(monkeypatch):
+    def fake_run(argv, **kwargs):
+        raise OSError("synthetic query launch failure")
+    monkeypatch.setattr(campaign_condor.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="outcome unknown"):
+        campaign_condor.query_job(75142, 0)
+
+
+@pytest.mark.parametrize("rows, error", [
+    ([{"ClusterId": 75143, "ProcId": 0, "JobStatus": 3}], "identity differs"),
+    ([{"ClusterId": 75142, "ProcId": 1, "JobStatus": 3}], "identity differs"),
+    ([{"ClusterId": 75142, "ProcId": 0, "JobStatus": 3}] * 2, "cardinality is uncertain")])
+def test_exact_job_query_rejects_foreign_or_multiple_rows(monkeypatch, rows, error):
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
+    monkeypatch.setattr(campaign_condor.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match=error):
+        campaign_condor.query_job(75142, 0)
 
 
 def test_terminal_scheduler_failure_has_no_success_receipt(condor_case, monkeypatch):

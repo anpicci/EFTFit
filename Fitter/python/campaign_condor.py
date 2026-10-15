@@ -69,11 +69,14 @@ def query_job(cluster_id, proc_id):
             raise RuntimeError("Condor outcome unknown for " + identity) from error
         if completed.returncode != 0:
             raise RuntimeError("Condor {} query failed for {}: {}".format(command, identity, completed.stderr))
-        try:
-            import json
-            rows = json.loads(completed.stdout)
-        except (ValueError, TypeError) as error:
-            raise RuntimeError("Condor query returned malformed JSON for " + identity) from error
+        if isinstance(completed.stdout, str) and not completed.stdout.strip():
+            rows = []
+        else:
+            try:
+                import json
+                rows = json.loads(completed.stdout)
+            except (ValueError, TypeError) as error:
+                raise RuntimeError("Condor query returned malformed JSON for " + identity) from error
         if not isinstance(rows, list) or len(rows) > 1:
             raise RuntimeError("Condor query cardinality is uncertain for " + identity)
         if rows:
