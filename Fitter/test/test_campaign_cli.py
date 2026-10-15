@@ -510,7 +510,7 @@ def test_full_population_condor_planning_and_missing_provider(campaign_inputs, i
     assert "select --backend" in invoke("plan", campaign_id, expected=2, backend_map=None)["error"]
     plan = invoke("plan", campaign_id, "--backend", "condor", "--dry-run", backend_map=None)
     assert len(plan["plan"]["jobs"]) == 52
-    assert plan["plan"]["capabilities"] == {"plan": True, "dispatch": False, "collect": False}
+    assert plan["plan"]["capabilities"] == {"plan": True, "dispatch": True, "collect": True}
     jobs = plan["plan"]["jobs"]
     assert len({job["job_set_id"] for job in jobs}) == len(jobs)
     assert len({job["execution_provenance"]["output_label"] for job in jobs}) == len(jobs)
@@ -522,7 +522,7 @@ def test_full_population_condor_planning_and_missing_provider(campaign_inputs, i
     assert job["command_argvs"][0][job["command_argvs"][0].index("--lastPoint") + 1] == "4"
     assert job["point_indices"] == list(range(5))
     actual = invoke("plan", campaign_id, "--backend", "condor", backend_map=None)
-    assert "not qualified" in invoke("dispatch", campaign_id, actual["request"]["attempt_id"], backend_map=None, expected=2)["error"]
+    assert "requires condor_runtime" in invoke("dispatch", campaign_id, actual["request"]["attempt_id"], backend_map=None, expected=2)["error"]
     assert all(p["status"] == "planned" for p in invoke("status", campaign_id, backend_map={})["points"])
     record_property("full_population_plan", json.dumps({"scan_ids": sorted({p["scan_id"] for p in initial["points"]}),
         "point_count": len(initial["points"]), "job_count": len(plan["plan"]["jobs"]),

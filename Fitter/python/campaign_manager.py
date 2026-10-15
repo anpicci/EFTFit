@@ -315,6 +315,8 @@ def validate_member(attempt, link, member, spec):
     references = [member["manifest"], member["attempt_record"]]
     if "worker_result" in member:
         references.append(member["worker_result"])
+    if "submission_response" in member:
+        references.append(member["submission_response"])
     for reference in references:
         verify_reference(reference)
     manifest = validate_execution_identity(read_json(member["manifest"]["resolved_path"]))
@@ -399,8 +401,12 @@ def collect(root, campaign_id, attempt_id, dry_run=False, backends=None):
                 receipt["references"] = [member["manifest"], member["attempt_record"]]
                 if "worker_result" in member:
                     receipt["references"].append(member["worker_result"])
+                if "submission_response" in member:
+                    receipt["references"].append(member["submission_response"])
+                    receipt["scheduler_outcome"] = member["scheduler_outcome"]
+                    receipt["scheduler_id"] = member["scheduler_id"]
                 if member.get("worker_status") not in (None, "completed"):
-                    receipt.update(status="invalid", reason="local worker " + member["worker_status"] +
+                    receipt.update(status="invalid", reason=attempt["actual_backend"] + " worker " + member["worker_status"] +
                                    " (exit_code={})".format(member.get("worker_exit_code")))
                     receipts.append(receipt)
                     continue

@@ -2,10 +2,10 @@
 
 The canonical frontend is `Fitter/scripts/eftfit_campaign.py`. It manages a
 versioned local campaign envelope with one editable YAML. The shipped `local`
-provider dispatches and collects direct Combine members. Its process and
-receipt lifecycle has synthetic test coverage; real CMSSW execution requires
-separate owner qualification. The `condor` provider remains no-submit planning
-only. Lobster and CRAB campaign providers are not implemented. Synthetic providers
+provider dispatches and collects direct Combine members. The `condor` provider
+dispatches the same planned members through `condor_submit` and collects bounded
+Condor outcomes. Both paths have synthetic test coverage; real CMSSW and scheduler
+execution require separate owner qualification. Lobster and CRAB campaign providers
 exist only in tests and are not selectable in the installed CLI.
 
 ## One YAML
@@ -31,6 +31,11 @@ grid:
 backend: condor       # optional default for new execution plans
 # To dispatch locally, add to this same YAML:
 # local_runtime:
+#   cmsset_default: /path/to/cmsset_default.sh
+#   scram_arch: <supported SCRAM_ARCH>
+#   release_src: /path/to/CMSSW/src
+# To dispatch through Condor on a shared filesystem, add:
+# condor_runtime:
 #   cmsset_default: /path/to/cmsset_default.sh
 #   scram_arch: <supported SCRAM_ARCH>
 #   release_src: /path/to/CMSSW/src
@@ -61,6 +66,16 @@ records the setup file identity; the worker outcome records the resolved
 checks establish setup and binary lookup; only the worker exit and output show
 whether Combine ran successfully. Runtime settings do not enter the scientific
 job-set identity.
+
+`condor_runtime` uses the same typed release bindings for Condor dispatch.
+The controller, submit host and workers must share readable source, setup,
+release, workspace, and attempt paths and writable attempt/result storage.
+The worker uses `/usr/bin/python3` for its standard-library adapter, then a
+clean non-login CMSSW Bash for the planned `combine` argv. Condor does not
+transfer inputs in this provider. Controller readability alone does not prove
+worker access; deployment paths, admission and resources require a separate
+real preparation check. No CPU, memory or disk request is inferred from the
+synthetic examples.
 
 For runtime Asimov generation, use `dataset: {mode: expected, truth: sm}`.
 The frozen effective spec records `nuisance_generation: nominal`; the plan
@@ -120,6 +135,7 @@ The examples assume the EFTFit repository root as the working directory.
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns create campaign.yml
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns status CAMPAIGN_ID
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns plan CAMPAIGN_ID --backend condor --dry-run
+python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns plan CAMPAIGN_ID --backend condor
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns plan CAMPAIGN_ID --backend local --dry-run
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns retry CAMPAIGN_ID --backend condor --dry-run
 python Fitter/scripts/eftfit_campaign.py --root /path/to/campaigns rescue CAMPAIGN_ID --backend condor --strategy minimizer_strategy_1 --dry-run
@@ -175,7 +191,8 @@ earlier members even when the scientific job-set ID is unchanged.
 The Condor plan renders the same argv arrays into a worker script and an
 explicit queue containing exactly the selected intervals. Planning runs no fit
 and submits nothing. The scripts, submit descriptions and working directories
-are projections requiring separate materialization and deployment review.
+are projections. Condor dispatch materializes a bound submit file, worker
+entrypoint and immutable 009A manifest/attempt record before submission.
 `--gridPoints`, `--split-points` and CombineTool are excluded from new plans.
 Original indices and expected coordinates remain bound to the frozen campaign
 even for sparse retry/rescue.
@@ -185,8 +202,8 @@ retain their CombineTool identity and byte format. Their decoder remains
 available for old jobs; new campaign plans use direct `combine`. The schema-4
 member list binds job-set identity and is shared by both renderers, attempt
 records and member checks. A plan does not assert that a member exists or is a
-valid ROOT result. Condor recovery submission and aggregation remain blocked
-pending execution and cross-member reference-NLL qualification. A
+valid ROOT result. Cross-member reference-NLL qualification and aggregation
+remain separate. A
 valid member or byte-bound final sidecar alone does not establish compatible
 reference fits. Real CMSSW execution and target storage remain separately unqualified.
 
@@ -201,7 +218,18 @@ with its error and process exit code; collection does not accept that member.
 Nonzero exit, missing output and invalid ROOT are classified
 separately. Collection is read-only at the provider boundary; the campaign
 then commits one atomic batch of scientific receipts. Duplicate dispatch or
-collection is rejected. Condor dispatch and collection remain unavailable.
+collection is rejected. Condor dispatch records an intent before calling
+`condor_submit -terse`, binds the returned cluster and contiguous process range
+to the exact planned member set, and records the raw response. A nonzero,
+missing, malformed or lost response does not create a successful binding; a
+possible submission requires manual investigation before any new attempt.
+Condor collection queries only bound scheduler identities. Idle, running,
+held, suspended, transferring, evicted or unknown outcomes leave the campaign
+intent uncollected. Terminal scheduler failures produce invalid member receipts.
+Terminal success requires identity-bound worker evidence and still passes the
+ordinary ROOT and coordinate validator. Missing ROOT becomes a missing receipt;
+collisions and publication failures remain invalid. A terminal worker exit alone
+does not qualify the fit. No automatic submission, retry or background query occurs.
 There is no implicit dispatch from retry/rescue or dynamic provider import
 from YAML.
 
