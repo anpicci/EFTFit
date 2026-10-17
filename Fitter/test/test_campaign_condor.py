@@ -7,9 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+import numpy as np
+import uproot
 
 from test_campaign_cli import native_inputs, cli
-from test_campaign_manager import campaign_inputs
+from test_campaign_manager import campaign_inputs, fake_prepare_reference
 from python import campaign_condor
 from python.campaign_backend import condor_plan_backend, local_plan_backend
 from python.campaign_spec import digest, load_spec
@@ -39,8 +41,9 @@ def condor_case(native_inputs, monkeypatch, capsys):
         return {"ClusterId": cluster, "ProcId": proc, "JobStatus": 4, "ExitCode": 0}
     monkeypatch.setattr(campaign_condor, "submit_job", submit_job)
     monkeypatch.setattr(campaign_condor, "query_job", query_job)
+    monkeypatch.setattr(condor_plan_backend, "prepare_reference", fake_prepare_reference)
     def invoke(*args, expected=0):
-        code = cli.main(["--root", str(root), *map(str, args)])
+        code = cli.main(["--root", str(root), "--json", *map(str, args)])
         captured = capsys.readouterr()
         assert code == expected, captured.err
         return json.loads(captured.out if code == 0 else captured.err)
@@ -547,6 +550,7 @@ def test_sparse_two_member_submission_uses_planned_queue(condor_case):
     data["grid"]["selected_indices"] = [1, 3]
     source.write_text(yaml.safe_dump(data))
     campaign_id = invoke("create", source)["campaign_id"]
+    invoke("prepare-reference", campaign_id, "--scan-id", "ctG:profiled")
     planned = invoke("plan", campaign_id)
     job = planned["plan"]["jobs"][0]
     assert [(member["first_point"], member["last_point"]) for member in job["expected_members"]] == [(1, 1), (3, 3)]
@@ -561,6 +565,7 @@ def test_sparse_members_keep_independent_terminal_receipts(condor_case, monkeypa
     data["grid"]["selected_indices"] = [1, 3]
     source.write_text(yaml.safe_dump(data))
     campaign_id = invoke("create", source)["campaign_id"]
+    invoke("prepare-reference", campaign_id, "--scan-id", "ctG:profiled")
     planned = invoke("plan", campaign_id)
     attempt_id = planned["request"]["attempt_id"]
     job = planned["plan"]["jobs"][0]
@@ -573,3 +578,78 @@ def test_sparse_members_keep_independent_terminal_receipts(condor_case, monkeypa
     receipts = invoke("collect", campaign_id, attempt_id)["receipts"]
     assert [(item["point_index"], item["status"]) for item in receipts] == [(1, "invalid"), (3, "accepted")]
     assert invoke("status", campaign_id)["points"][3]["status"] == "accepted"
+    retry = invoke("retry", campaign_id, "--dry-run")
+    assert retry["plan"]["jobs"][0]["point_indices"] == [1]
+    assert retry["plan"]["jobs"][0]["execution_provenance"]["shared_reference"] == job["execution_provenance"]["shared_reference"]
+    assert retry["plan"]["jobs"][0]["command_argvs"][0][
+        retry["plan"]["jobs"][0]["command_argvs"][0].index("--points") + 1] == "5"
+    retry = invoke("retry", campaign_id)
+    retry_attempt = retry["request"]["attempt_id"]
+    retry_job = retry["plan"]["jobs"][0]
+    invoke("dispatch", campaign_id, retry_attempt)
+    complete_worker(condor_case, retry_job, retry_attempt, output="none")
+    retry_member = retry_job["expected_members"][0]
+    retry_path = Path(retry_job["execution_provenance"]["execution_directory"]) / retry_member["file_name"]
+    coordinate = retry["request"]["points"][0]["coordinate"]
+    with uproot.recreate(retry_path) as output:
+        tree = output.mktree("limit", {"ctG": "float32", "deltaNLL": "float32",
+                                        "quantileExpected": "float32"})
+        tree.extend({"ctG": np.array([coordinate], dtype="f4"),
+                     "deltaNLL": np.array([1.0], dtype="f4"),
+                     "quantileExpected": np.array([0], dtype="f4")})
+    monkeypatch.setattr(campaign_condor, "query_job", lambda cluster, proc: {
+        "ClusterId": cluster, "ProcId": proc, "JobStatus": 4, "ExitCode": 0})
+    recovered = invoke("collect", campaign_id, retry_attempt)["receipts"]
+    assert [(item["point_index"], item["status"]) for item in recovered] == [(1, "accepted")]
+    assert recovered[0]["reference_group"] == receipts[1]["reference_group"]
+    assert invoke("status", campaign_id)["points"][3]["canonical"]["attempt_id"] == attempt_id
+
+
+def test_shared_reference_collects_distinct_owned_members(condor_case):
+    source, _, _, invoke = condor_case
+    data = yaml.safe_load(source.read_text())
+    data["grid"]["selected_indices"] = [1, 3]
+    source.write_text(yaml.safe_dump(data))
+    campaign_id = invoke("create", source)["campaign_id"]
+    reference = invoke("prepare-reference", campaign_id, "--scan-id", "ctG:profiled")["reference"]
+    planned = invoke("plan", campaign_id)
+    attempt_id = planned["request"]["attempt_id"]
+    job = planned["plan"]["jobs"][0]
+    invoke("dispatch", campaign_id, attempt_id)
+    for member, point in zip(job["expected_members"], planned["request"]["points"]):
+        complete_worker(condor_case, job, attempt_id, index=member["member_index"], output="none")
+        output_path = Path(job["execution_provenance"]["execution_directory"]) / member["file_name"]
+        with uproot.recreate(output_path) as output:
+            tree = output.mktree("limit", {"ctG": "float32", "deltaNLL": "float32",
+                                            "quantileExpected": "float32"})
+            tree.extend({"ctG": np.array([point["coordinate"]], dtype="f4"),
+                         "deltaNLL": np.array([float(point["point_index"])], dtype="f4"),
+                         "quantileExpected": np.array([0], dtype="f4")})
+    receipts = invoke("collect", campaign_id, attempt_id)["receipts"]
+    assert [(item["point_index"], item["status"]) for item in receipts] == [(1, "accepted"), (3, "accepted")]
+    assert receipts[0]["reference_group"] == receipts[1]["reference_group"]
+    assert receipts[0]["reference_group"]["reference_sha256"] == reference["artifact"]["sha256"]
+    assert receipts[0]["execution_link"]["member"] != receipts[1]["execution_link"]["member"]
+
+
+def test_worker_rejects_changed_shared_reference_before_launch(condor_case, monkeypatch):
+    source, _, _, invoke = condor_case
+    data = yaml.safe_load(source.read_text())
+    data["grid"]["selected_indices"] = [1, 3]
+    source.write_text(yaml.safe_dump(data))
+    campaign_id = invoke("create", source)["campaign_id"]
+    ready = invoke("prepare-reference", campaign_id, "--scan-id", "ctG:profiled")["reference"]
+    planned = invoke("plan", campaign_id)
+    attempt_id = planned["request"]["attempt_id"]
+    job = planned["plan"]["jobs"][0]
+    invoke("dispatch", campaign_id, attempt_id)
+    reference_path = Path(ready["artifact"]["resolved_path"])
+    reference_path.write_bytes(b"changed synthetic reference")
+    payload_path = Path(job["execution_provenance"]["scheduler_directory"]) / (
+        "campaign_" + attempt_id) / "worker_payload.json"
+    def forbidden_run(*args, **kwargs):
+        raise AssertionError("worker launched Combine after reference changed")
+    monkeypatch.setattr(campaign_condor.subprocess, "run", forbidden_run)
+    assert campaign_condor.run_worker(payload_path, "0", "75142", "0") == 1
+    result_path = payload_path.parent / "member_0000" / "worker_result.json"
+    assert "changed" in read_json(result_path)["error"]

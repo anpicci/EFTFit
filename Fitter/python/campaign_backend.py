@@ -11,12 +11,13 @@ from pathlib import Path
 
 from . import campaign_condor
 from .execution_provenance import (build_direct_attempt_record, build_direct_grid_provenance,
-                                   file_identity, read_json, sha256_file,
+                                   file_identity, read_json, sha256_file, workspace_identity,
+                                   partition_grid_indices,
                                    validate_direct_attempt_record, validate_direct_grid_provenance,
                                    write_json_exclusive)
 from .wc_fit_config import build_configured_grid_scan_command
 from .campaign_spec import (default_condor_request_memory_mb, digest, fit_config,
-                            planned_points)
+                            planned_points, reference_contract)
 
 
 def runtime_identity():
@@ -42,6 +43,49 @@ def grid_argv(spec, point, strategy):
     args[0] = "combine"
     if strategy == "minimizer_strategy_1":
         args[args.index("--cminDefaultMinimizerStrategy=0")] = "--cminDefaultMinimizerStrategy=1"
+    return args
+
+
+def reference_argv(spec, point, label):
+    """The global fit generates the expected toy at zero before saving its snapshot."""
+    args = grid_argv(spec, point, None)
+    for option in ("--points", "--alignEdges"):
+        index = args.index(option)
+        del args[index:index + 2]
+    args[args.index("grid")] = "none"
+    args += ["--saveWorkspace", "--saveFitResult", "-n", label]
+    if spec["dataset"]["mode"] == "expected":
+        args.append("--saveToys")
+    return args
+
+
+def resolved_points_per_member(spec, provider_name):
+    if "execution" not in spec:  # Frozen legacy effective specification.
+        return None
+    value = spec["execution"]["points_per_member"]
+    return ("all" if provider_name == "local" else 5) if value == "auto" else value
+
+
+def reference_required(spec, provider_name, selected_indices):
+    if "reference" not in spec:
+        return False
+    if spec["reference"]["mode"] == "shared_snapshot":
+        return True
+    _, intervals = partition_grid_indices(spec["grid"]["points"], selected_indices,
+        resolved_points_per_member(spec, provider_name))
+    return len(intervals) > 1
+
+
+def shared_member_argv(spec, point, strategy, reference):
+    args = grid_argv(spec, point, strategy)
+    args[args.index("-d") + 1] = reference["artifact"]["resolved_path"]
+    # Combine loads --snapshotName before --setParameters. Leaving the zero
+    # assignment here would replace the fitted state used for the NLL anchor.
+    index = args.index("--setParameters")
+    del args[index:index + 2]
+    args += ["--snapshotName", "MultiDimFit", "--skipInitialFit"]
+    if spec["dataset"]["mode"] == "expected":
+        args += ["--toysFile", reference["artifact"]["resolved_path"]]
     return args
 
 
@@ -89,6 +133,64 @@ class condor_plan_backend:
     name = "condor"
     capabilities = {"plan": True, "dispatch": True, "collect": True}
 
+    def prepare_reference(self, spec, argv, output_directory, output_path):
+        """Run one declared reference through the existing clean CMSSW runtime."""
+        runtime = (local_plan_backend().runtime(spec) if "local_runtime" in spec
+                   else self.runtime(spec))
+        output_directory = Path(output_directory)
+        output_directory.parent.mkdir(mode=0o700, exist_ok=True)
+        output_directory.mkdir(mode=0o700)
+        stdout_path = output_directory / "stdout.txt"
+        stderr_path = output_directory / "stderr.txt"
+        resolution_path = output_directory / "runtime_resolution.txt"
+        script = ("set -euo pipefail -C\n"
+            "export SCRAM_ARCH=\"$2\"\nset +u\nsource \"$1\"\ncd \"$3\"\ncmsenv\nset -u\n"
+            "ulimit -s unlimited\nulimit -c 0\nhash -r\n"
+            "resolved_combine=\"$(command -v combine || true)\"\n"
+            "printf '%s\\n' \"SCRAM_ARCH=$SCRAM_ARCH\" \"CMSSW_BASE=${CMSSW_BASE-}\" \"combine_executable=$resolved_combine\" > \"$5\"\n"
+            "if [[ -z \"${CMSSW_BASE-}\" || \"$CMSSW_BASE\" != /* || ! -d \"$CMSSW_BASE/src\" || \"$(cd -- \"$CMSSW_BASE/src\" && pwd -P)\" != \"$(pwd -P)\" || \"$resolved_combine\" != /* || ! -x \"$resolved_combine\" || ! -x \"$CMSSW_BASE/bin/$2/combine\" || \"$(readlink -f -- \"$resolved_combine\")\" != \"$(readlink -f -- \"$CMSSW_BASE/bin/$2/combine\")\" ]]; then exit 1; fi\n"
+            "cd \"$4\"\nshift 5\nexec \"$@\"\n")
+        command = ["/bin/bash", "--noprofile", "--norc", "-c", script,
+                   "eftfit_reference", runtime["cmsset_default"]["resolved_path"],
+                   runtime["scram_arch"], runtime["release_src"], str(output_directory),
+                   str(resolution_path), *argv]
+        environment = {"PATH": "/usr/bin:/bin"}
+        for key in ("HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP"):
+            if key in os.environ:
+                environment[key] = os.environ[key]
+        if file_identity(runtime["cmsset_default"]["resolved_path"]) != runtime["cmsset_default"]:
+            raise ValueError("reference CMSSW setup changed")
+        with stdout_path.open("x", encoding="utf-8") as stdout, stderr_path.open("x", encoding="utf-8") as stderr:
+            completed = subprocess.run(command, cwd=output_directory, env=environment,
+                                       stdout=stdout, stderr=stderr, check=False)
+        if completed.returncode != 0:
+            raise RuntimeError("reference fit failed with exit code {}".format(completed.returncode))
+        if Path(output_path).is_symlink() or not Path(output_path).is_file():
+            raise ValueError("reference output is absent or unsafe")
+        artifact = file_identity(output_path)
+        if artifact["size_bytes"] == 0:
+            raise ValueError("reference output is empty")
+        import uproot
+        label = argv[argv.index("-n") + 1]
+        fit_result_path = output_directory / ("multidimfit" + label + ".root")
+        if fit_result_path.is_symlink() or not fit_result_path.is_file():
+            raise ValueError("reference fit result is absent or unsafe")
+        try:
+            with uproot.open(output_path) as source:
+                if "w" not in source:
+                    raise ValueError("reference output lacks the saved workspace")
+                if spec["dataset"]["mode"] == "expected" and "toys/toy_asimov" not in source:
+                    raise ValueError("reference output lacks the saved Asimov toy")
+            with uproot.open(fit_result_path) as source:
+                if "fit_mdf" not in source:
+                    raise ValueError("reference output lacks the global fit result")
+        except (OSError, KeyError) as error:
+            raise ValueError("reference output is not a readable ROOT artifact") from error
+        return {"artifact": artifact, "runtime": runtime,
+                "fit_result": file_identity(fit_result_path),
+                "stdout": file_identity(stdout_path), "stderr": file_identity(stderr_path),
+                "runtime_resolution": file_identity(resolution_path)}
+
     def plan(self, request, spec, allow_existing=False):
         expected = {(point["scan_id"], point["point_index"]): point
                     for point in planned_points(spec)}
@@ -106,6 +208,22 @@ class condor_plan_backend:
         jobs = []
         for scan_id, scan_points in sorted(scans.items()):
             point = scan_points[0]
+            indices = [p["point_index"] for p in scan_points]
+            reference = request.get("references", {}).get(scan_id)
+            needs_reference = reference_required(spec, self.name, indices)
+            if needs_reference and reference is None:
+                raise ValueError("shared reference is not ready for " + scan_id + "; prepare-reference before plan")
+            if reference is not None:
+                if (reference.get("scan_id") != scan_id or
+                        reference.get("scientific_contract") != reference_contract(spec, point)):
+                    raise ValueError("shared reference scientific contract differs")
+                reference_workspace = workspace_identity(reference["artifact"]["resolved_path"])
+                if reference_workspace["sha256"] != reference["artifact"]["sha256"]:
+                    raise ValueError("shared reference artifact changed")
+                base_argv = shared_member_argv(spec, point, request["strategy"], reference)
+            else:
+                reference_workspace = spec["workspace"]
+                base_argv = grid_argv(spec, point, request["strategy"])
             # A worker-runtime binding cannot change the physical job identity.
             scientific_digest = digest({key: value for key, value in spec.items()
                                         if key not in ("local_runtime", "condor_runtime")})
@@ -113,9 +231,9 @@ class condor_plan_backend:
                 "generation_id": request["generation_id"], "scan_id": scan_id,
                 "spec_digest": scientific_digest})
             provenance = build_direct_grid_provenance(
-                scan_name, grid_argv(spec, point, request["strategy"]), spec["workspace"],
-                spec["grid"]["points"], [p["point_index"] for p in scan_points],
-                request["execution_root"])
+                scan_name, base_argv, reference_workspace,
+                spec["grid"]["points"], indices, request["execution_root"],
+                resolved_points_per_member(spec, self.name), reference)
             validate_direct_grid_provenance(provenance, scan_name)
             attempt_directory = os.path.join(provenance["scheduler_directory"],
                                              "campaign_" + request["attempt_id"])
@@ -479,6 +597,8 @@ class local_plan_backend(condor_plan_backend):
                 try:
                     if file_identity(runtime["cmsset_default"]["resolved_path"]) != runtime["cmsset_default"]:
                         raise ValueError("local CMSSW setup changed after dispatch intent")
+                    if file_identity(provenance["workspace_identity"]["resolved_path"])["sha256"] != provenance["workspace_identity"]["sha256"]:
+                        raise ValueError("local workspace/reference changed after planning")
                     with stdout_path.open("x", encoding="utf-8") as stdout, stderr_path.open("x", encoding="utf-8") as stderr:
                         completed = subprocess.run(worker_command, cwd=work_directory,
                             env=worker_environment, stdout=stdout, stderr=stderr, check=False)

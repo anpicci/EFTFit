@@ -28,6 +28,10 @@ grid:
   points: 5           # synthetic illustration, NOT a production recommendation
   align_edges: true  # explicit; false selects bin centers
   selected_indices: [1, 3]  # optional original-grid work request
+execution:
+  points_per_member: auto  # optional; Condor auto is 5, local auto is all
+reference:
+  mode: auto  # optional; split logical scans require a prepared shared snapshot
 backend: condor       # optional default for new execution plans
 # To dispatch locally, add to this same YAML:
 # local_runtime:
@@ -50,6 +54,63 @@ workspace. The observed dataset name is a workspace object name; external
 `file:dataset` selectors are unsupported because their bytes would require an
 additional identity contract. Dataset presence and workspace scientific
 qualification remain prerequisites to future real execution.
+
+`execution.points_per_member` accepts a positive integer, `all`, or `auto`.
+An integer is the maximum length of each member's consecutive original-index
+interval on either provider. Condor `auto` resolves to 5 points per member;
+local `auto` resolves to `all`. These are execution defaults, not statistical
+constants, and the actual job count follows the selected spans. For example,
+100 consecutive points yield 20 members at 5 points each; 103 yield 21 with a
+100–102 tail. Fifty isolated even indices yield 50 members. `all` leaves each
+maximal contiguous selected span intact: a sparse selection can still create
+multiple members. Workers retain the global `--points`, `--alignEdges`, ranges,
+and original `--firstPoint`/`--lastPoint`. The native plan records its resolved
+policy and exact intervals. New YAML without `execution` freezes `auto`.
+Previously recorded effective specs without `execution` keep the historical
+maximal-contiguous-span behavior and their original manifest interpretation.
+
+For a new plan with multiple members in one logical scan, `reference.mode:
+auto` requires a shared reference. `reference.mode: shared_snapshot` requests
+it even for a single member. Prepare each logical scan with
+`prepare-reference CAMPAIGN_ID --scan-id WC:MODE` before publishing its member
+plan. Preparation is an explicit operation and may run a real global fit; a
+`plan --dry-run` never performs it. The reference uses the same scientific
+workspace, dataset mode, POI/profile/freeze controls and parameter ranges.
+For expected SM, Combine saves the generated Asimov toy and the fitted
+`MultiDimFit` snapshot in the reference output. Preparation also requires a
+saved global fit-result object before recording a ready reference; its presence
+alone does not certify convergence. Members load that snapshot,
+read the saved toy with `--toysFile`, and skip their initial fit. They do not
+apply the zero-valued generation assignments again after loading the fitted
+snapshot. For observed mode, members read the named stored dataset from the
+saved workspace. A failed or interrupted preparation is never marked ready;
+the native event history and status show its outcome or unresolved intent.
+Legacy effective specs without `reference` retain independent-fit semantics.
+
+| Producer input | EFTFit dataset mode | Dataset fitted |
+| --- | --- | --- |
+| Blinded standard card | `observed` | Stored `data_obs`, which is precomputed SM Asimov for that producer lineage |
+| Blinded standard card | `expected`, `truth: sm` | Combine-generated SM Asimov under the declared nominal generation configuration |
+| Unblinded card | `observed` | Stored real `data_obs` |
+| Unblinded card | `expected`, `truth: sm` | Combine-generated SM Asimov under the declared nominal generation configuration |
+
+`producer_label`, `observed`, and `data_obs` alone do not prove the contents of
+a stored dataset. A blinded stored Asimov and a runtime-generated Asimov are
+different constructions. The generation truth, minimizer start and fitted
+snapshot are distinct. This shared reference is scoped to parallel 1D scans;
+it does not impose a global prerequisite on ordinary inference or impacts.
+The partition helper accepts effective original indices, including a
+producer's nontrivial effective grid cardinality, but the native campaign
+adapter and physical-row reader here remain 1D. Multidimensional campaigns
+and impacts execution require their own native scientific adapters.
+
+Synthetic tests validate planning, fake reference outcomes, member ownership,
+and recovery without running Combine or Condor. The first real N=100 centered
+expected-SM ctG reference and five-point members require a separate authorized
+production run. Its readback must check the intended dataset/common NLL
+reference, unique physical points 0–99, and agreement with the accepted
+monolithic curve under scientific judgment. Synthetic evidence establishes
+neither empirical NLL equality, convergence nor speedup.
 
 `local_runtime` is optional for planning and required for local dispatch. It
 contains typed setup-script, architecture, and release-source bindings;
@@ -87,9 +148,11 @@ examples.
 For runtime Asimov generation, use `dataset: {mode: expected, truth: sm}`.
 The frozen effective spec records `nuisance_generation: nominal`; the plan
 emits `-t -1` and the package-authoritative 26 scientific plus 10 fixed-zero
-WC assignments through `--setParameters`. This single command uses that zero
-state for generation and the initial fit. A different generation truth or a
-fit start distinct from it is rejected before campaign creation. The nominal
+WC assignments through `--setParameters` for an independent single-member fit
+or shared reference fit. In the shared case, members read the saved Asimov toy
+and fitted snapshot without reapplying those zero assignments. A different
+generation truth is unsupported; nonzero fit starts are separately unsupported
+by the configured argv builder. The nominal
 expected path does not inject a workspace dataset name. Either fit-side mode
 may accompany blinded or unblinded producer cards. `observed` emits
 `--dataset <name>` and no toy flag; omitted `name` defaults to `data_obs` in
@@ -100,14 +163,11 @@ records the YAML author's card provenance label in the frozen spec without
 changing the fit-side mode or certifying that label.
 
 At `CombinedLimit@6a5a27ec49d677e93833aec13d76cd8bea3e0050`,
-frequentist nuisance conditioning, `--bypassFrequentistFit`, and
-`--snapshotName` remain unavailable in this frontend. Pinned Combine source
-shows that the frequentist Asimov path consumes a named input dataset even
-when the fit is bypassed, while a snapshot loads workspace state before WC
-assignments. The current planner cannot verify the required dataset or
-snapshot object and contents. Such options fail schema validation instead of
-silently falling back to nominal generation. No generated Asimov result is
-claimed equivalent to a prebuilt card observation.
+frequentist nuisance conditioning and `--bypassFrequentistFit` remain outside
+this frontend. Shared parallel scans use the source-supported `MultiDimFit`
+snapshot and saved-toy route described above. The first real run must verify
+the dataset, global-observable state and NLL convention empirically. No
+generated Asimov result is claimed equivalent to a prebuilt card observation.
 
 `grid.selected_indices` is an optional nonempty unique list of original
 indices from `0` through `points - 1`. The effective spec sorts it; local and
@@ -188,9 +248,9 @@ execution links; provider names are not part of campaign or point identity.
 
 Without `--dry-run`, planning records an immutable planned attempt. It does not
 dispatch it. Plans contain argv arrays and predicted 009A links; these are not
-receipts proving that execution occurred. A schema-4 EFTFit/009A direct-grid
-plan freezes the original `N`, exact selected indices and maximal contiguous
-intervals. Each interval has one typed expected member and one direct `combine`
+receipts proving that execution occurred. A new schema-5 EFTFit/009A direct-grid
+plan freezes the original `N`, exact selected indices, resolved points-per-member
+policy and partition intervals. Each interval has one typed expected member and one direct `combine`
 argv with exactly one `--points N`, `--firstPoint i`, and `--lastPoint j`.
 The local plan returns those argv arrays and distinct attempt working paths.
 Each reserved attempt has its own execution root, so retries cannot replace
@@ -206,8 +266,8 @@ even for sparse retry/rescue.
 
 Historical schema-3 full-grid 009A manifests, attempts and final receipts
 retain their CombineTool identity and byte format. Their decoder remains
-available for old jobs; new campaign plans use direct `combine`. The schema-4
-member list binds job-set identity and is shared by both renderers, attempt
+available for old jobs; new campaign plans use direct `combine`. Schema-4 and
+schema-5 member lists bind job-set identity and are shared by both renderers, attempt
 records and member checks. A plan does not assert that a member exists or is a
 valid ROOT result. Cross-member reference-NLL qualification and aggregation
 remain separate. A
@@ -274,15 +334,20 @@ grid spacing and float32 output precision.
 scheduler claim. Missing scheduler evidence after interruption needs explicit
 inspection. Member presence is insufficient: collection validates 009A
 job/attempt/member ownership, reopens ROOT through `scan_1d`, checks coordinates,
-and binds the receipt to the exact bytes. Changed/missing evidence invalidates
-only the affected status. A valid duplicate is accepted by the existing consumer
-and is excluded from automatic retry. `deltaNLL=9990` is invalid, never a physical
+and binds the receipt to the exact bytes. Later missing or changed evidence is
+shown as an `evidence_issue` on an accepted historical point; it calls for
+focused diagnosis and does not silently turn that point into a fit failure or
+force a retry. Duplicate physical rows for one original coordinate are invalid.
+`deltaNLL=9990` is invalid, never a physical
 point. Special-only rows cannot satisfy a grid point. Consumer mask/drop/error
 and gap semantics are unchanged; this frontend uses mask for recovery evidence.
 
-Canonical promotion uses one validated member/reference group per logical scan.
-Further groups, including another attempt or backend, produce
-`PROMOTION_UNQUALIFIED_REFERENCE` for affected recovered points. No raw-NLL
+Canonical promotion for new shared scans uses the same scientific dataset,
+selection and reference artifact across members and eligible retries; different
+member and attempt identifiers do not change that group. Frozen legacy
+campaigns retain their original member-bound grouping. A scientifically
+unqualified different group produces `PROMOTION_UNQUALIFIED_REFERENCE` for
+affected recovered points. No raw-NLL
 minimum across attempts, offset guessing or automatic replacement is performed.
 A separate scan may establish its own group independently. An accepted point
 means a valid grid evaluation under this bounded consumer contract, not proof of
@@ -331,17 +396,17 @@ scientific authority for the new 1D campaign.
 | `Fitter/scripts/EFTFitter.py:455-457` at `py3Combine` | Zero starts for scan/tracked WCs unless overridden | Package population sets all scientific and fixed WCs to zero | Intentional difference: explicit SM generation state | Nominal command plan only |
 | `Fitter/scripts/EFTFitter.py:1503,1592` at `py3Combine` | Generated impacts scripts append `-t -1` on their blinded path | Fit-side `expected` adds `-t -1` independently of producer label | Intentional difference: separate dataset layers | Legacy impacts path only; no 1D parity claim |
 | `Fitter/python/CombineHelper.py:764` and `Fitter/scripts/combine_helper.py:675` at `py3Combine` | Saturated GoF helper adds `--toysFrequentist`; bypass is only a commented example | 1D frequentist conditioning is unsupported | Legacy only: different family and unverified input data | Requires separate qualification |
-| `Fitter/scripts/EFTFitter.py:440-484` at `py3Combine` | No active snapshot flag in inspected grid path | Named snapshot is unsupported | Not yet qualified: workspace snapshot contents are unverified | Inspected path only |
+| `Fitter/scripts/EFTFitter.py:440-484` at `py3Combine` | No active snapshot flag in inspected legacy grid path | Native shared scans load a prepared `MultiDimFit` snapshot | Synthetic contract only; empirical snapshot/NLL readback remains | Inspected legacy path only |
 | `Fitter/scripts/EFTFitter.py:484` at `py3Combine` | CombineTool output names | Job digest and `POINTS.i.j` member ownership | Intentional difference: receipt and collision control | Source compared |
 
-Of these six inspected rows, four are intentional differences, one is legacy
-only, and one remains unqualified. These counts describe the rows above only.
+The snapshot row describes the native shared-scan implementation; its empirical
+dataset and NLL qualification remains a separate real-run check.
 
 ## Qualification boundary
 
-Implemented: single YAML, frozen provenance, all six lifecycle operations,
+Implemented: single YAML, frozen provenance, explicit reference preparation,
 full and selected original-grid direct local/Condor no-submit mapping,
-schema-4 typed member/attempt validation with historical schema-3 readback,
+schema-5 typed member/attempt validation with schema-4 and historical schema-3 readback,
 mixed-provider identity via two synthetic doubles,
 local crash/concurrency guards, ROOT-backed validation, isolated quarantine,
 and read-only dry runs.

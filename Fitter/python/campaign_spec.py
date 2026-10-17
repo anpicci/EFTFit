@@ -48,7 +48,8 @@ def load_spec(path):
     source = path.read_text(encoding="utf-8")
     data = yaml.load(source, Loader=campaign_yaml_loader)
     fields(data, {"schema_version", "package", "workspace", "dataset", "selection", "grid"},
-           {"fit_start_values", "backend", "keep_failures", "local_runtime", "condor_runtime"})
+           {"fit_start_values", "backend", "keep_failures", "local_runtime", "condor_runtime",
+            "execution", "reference"})
     if type(data["schema_version"]) is not int or data["schema_version"] != 1:
         raise ValueError("unsupported campaign schema_version")
     if data.get("keep_failures", False) is not False:
@@ -116,6 +117,16 @@ def load_spec(path):
     backend = data.get("backend")
     if backend is not None and (not isinstance(backend, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", backend)):
         raise ValueError("backend must be a provider name")
+    execution = data.get("execution", {"points_per_member": "auto"})
+    fields(execution, {"points_per_member"})
+    points_per_member = execution["points_per_member"]
+    if not (type(points_per_member) is int and points_per_member > 0 or
+            points_per_member in ("auto", "all") and type(points_per_member) is str):
+        raise ValueError("execution.points_per_member must be a positive integer, auto or all")
+    reference = data.get("reference", {"mode": "auto"})
+    fields(reference, {"mode"})
+    if reference["mode"] not in ("auto", "shared_snapshot"):
+        raise ValueError("reference.mode must be auto or shared_snapshot")
     runtime_bindings = {}
     for runtime_name in ("local_runtime", "condor_runtime"):
         binding = data.get(runtime_name)
@@ -140,6 +151,7 @@ def load_spec(path):
     effective = {"schema_version": 1, "package": package_identity, "workspace": workspace,
                  "dataset": effective_dataset, "selection": {"wcs": wcs, "modes": modes},
                  "grid": effective_grid, "fit_start_values": starts, "default_backend": backend,
+                 "execution": {"points_per_member": points_per_member}, "reference": reference,
                  "keep_failures": False,
                  "fit_config": {"analysis": config.analysis, "scientific_wcs": config.scientific_wcs,
                                 "fixed_wcs": config.fixed_wcs, "wc_ranges": config.wc_ranges}}
@@ -151,6 +163,13 @@ def load_spec(path):
 def fit_config(spec):
     config = spec["fit_config"]
     return WCFitConfig(config["analysis"], tuple(config["scientific_wcs"]), tuple(config["fixed_wcs"]), config["wc_ranges"])
+
+
+def reference_contract(spec, point):
+    dataset = {key: value for key, value in spec["dataset"].items() if key != "producer_label"}
+    return {"dataset": dataset, "selection": point["mode"],
+            "wc": point["wc"], "workspace_sha256": spec["workspace"]["sha256"],
+            "fit_config": spec["fit_config"]}
 
 
 def planned_points(spec):

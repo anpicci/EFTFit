@@ -23,9 +23,190 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from python import campaign_manager as manager
 from python import campaign_state as state
 from python.campaign_backend import condor_plan_backend, local_plan_backend, grid_argv, runtime_identity
+from python.campaign_backend import reference_argv
 from python.campaign_spec import digest, load_spec
 from python.execution_provenance import (compute_job_set_id, file_identity,
-    identity_semantic_argv, build_direct_attempt_record, sha256_file, write_json_exclusive)
+    identity_semantic_argv, build_direct_attempt_record, sha256_file, write_json_exclusive,
+    validate_direct_grid_provenance, build_direct_grid_provenance, workspace_identity)
+
+
+def fake_prepare_reference(self, spec, argv, directory, output_path):
+    directory.mkdir(parents=True)
+    output_path.write_bytes(b"synthetic reference; no Combine execution")
+    fit_result = directory / ("multidimfit" + argv[argv.index("-n") + 1] + ".root")
+    fit_result.write_bytes(b"synthetic fit result; no Combine execution")
+    return {"artifact": file_identity(output_path), "fit_result": file_identity(fit_result),
+            "runtime": {"synthetic": True}}
+
+
+@pytest.mark.parametrize("count,indices,points_per_member,expected", [
+    (100, list(range(100)), 5, 20),
+    (103, list(range(103)), 5, 21),
+    (5, list(range(5)), 5, 1),
+    (3, list(range(3)), 5, 1),
+    (21, [1, 2, 7, 8, 20], 2, 3),
+    (21, [1, 2, 7, 8, 20], "all", 3),
+    (100, [i for i in range(100) if i != 2], 5, 21),
+    (100, list(range(0, 100, 2)), 5, 50),
+    (16, list(range(16)), 5, 4),
+])
+def test_partition_preserves_effective_original_indices(tmp_path, count, indices,
+                                                         points_per_member, expected):
+    workspace = tmp_path / "synthetic.root"
+    workspace.write_bytes(b"fixture only")
+    argv = ["combine", "-d", str(workspace), "-M", "MultiDimFit", "--algo", "grid",
+            "--points", str(count), "--alignEdges", "0"]
+    manifest = build_direct_grid_provenance(".synthetic", argv, workspace_identity(workspace),
+        count, indices, tmp_path / "execution", points_per_member)
+    assert validate_direct_grid_provenance(manifest) == manifest
+    intervals = manifest["intervals"]
+    assert len(intervals) == expected
+    flattened = [index for first, last in intervals for index in range(first, last + 1)]
+    assert flattened == sorted(indices) and len(flattened) == len(set(flattened))
+    assert all(first <= last and (points_per_member == "all" or
+               last - first + 1 <= points_per_member) for first, last in intervals)
+    assert all(command[command.index("--points") + 1] == str(count)
+               for command in manifest["command_argvs"])
+    if count == 103:
+        assert intervals[-1] == [100, 102]
+    if indices == [1, 2, 7, 8, 20]:
+        assert intervals == [[1, 2], [7, 8], [20, 20]]
+    if count == 100:
+        wrong_argv = list(argv)
+        wrong_argv[wrong_argv.index("--points") + 1] = "5"
+        with pytest.raises(ValueError, match="original point count"):
+            build_direct_grid_provenance(".synthetic", wrong_argv,
+                workspace_identity(workspace), count, indices,
+                tmp_path / "wrong_execution", points_per_member)
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "five", None])
+def test_invalid_points_per_member_rejected_before_campaign(campaign_inputs, value):
+    source, data, root = campaign_inputs
+    data["execution"] = {"points_per_member": value}
+    source.write_text(yaml.safe_dump(data))
+    with pytest.raises(ValueError, match="execution.points_per_member"):
+        manager.create(root, source)
+    assert not root.exists()
+
+
+def test_new_auto_and_explicit_local_partition(campaign_inputs, monkeypatch):
+    source, data, root = campaign_inputs
+    data["grid"]["points"] = 103
+    source.write_text(yaml.safe_dump(data))
+    monkeypatch.setattr(condor_plan_backend, "prepare_reference", fake_prepare_reference)
+    created = manager.create(root, source)
+    campaign_id = created["campaign_id"]
+    with pytest.raises(ValueError, match="prepare-reference"):
+        manager.plan(root, campaign_id, backend="condor", dry_run=True)
+    manager.prepare_reference(root, campaign_id, "c_one:profiled", backend="condor")
+    condor = manager.plan(root, campaign_id, backend="condor", dry_run=True)["plan"]["jobs"][0]
+    local = manager.plan(root, campaign_id, backend="local", dry_run=True)["plan"]["jobs"][0]
+    assert condor["execution_provenance"]["points_per_member"] == 5
+    assert len(condor["expected_members"]) == 21
+    assert condor["execution_provenance"]["intervals"][-1] == [100, 102]
+    assert local["execution_provenance"]["points_per_member"] == "all"
+    assert len(local["expected_members"]) == 1
+
+    data["execution"] = {"points_per_member": 2}
+    source.write_text(yaml.safe_dump(data))
+    second = manager.create(root, source)["campaign_id"]
+    manager.prepare_reference(root, second, "c_one:profiled", backend="local")
+    explicit = manager.plan(root, second, backend="local", dry_run=True)["plan"]["jobs"][0]
+    assert explicit["execution_provenance"]["points_per_member"] == 2
+    assert len(explicit["expected_members"]) == 52
+
+
+def test_centered_global_grid_survives_five_point_members(campaign_inputs, monkeypatch):
+    source, data, root = campaign_inputs
+    config_path = source.parent / "package" / "config" / "TOP_26_006.yml"
+    config = yaml.safe_load(config_path.read_text())
+    config["wc_ranges"]["c_one"] = [-1.6, 1.6]
+    config_path.write_text(yaml.safe_dump(config))
+    data["package"]["sha256"] = sha256_file(config_path)
+    data["grid"] = {"points": 100, "align_edges": False}
+    source.write_text(yaml.safe_dump(data))
+    spec, _ = load_spec(source)
+    points = manager.planned_points(spec)
+    assert len(points) == 100
+    assert all(point["coordinate"] == pytest.approx(-1.584 + 0.032 * point["point_index"])
+               for point in points)
+    monkeypatch.setattr(condor_plan_backend, "prepare_reference", fake_prepare_reference)
+    campaign_id = manager.create(root, source)["campaign_id"]
+    manager.prepare_reference(root, campaign_id, "c_one:profiled", backend="condor")
+    planned = manager.plan(root, campaign_id, backend="condor", dry_run=True)
+    job = planned["plan"]["jobs"][0]
+    assert len(job["expected_members"]) == 20
+    assert all(argv[argv.index("--points") + 1] == "100" and
+               argv[argv.index("--alignEdges") + 1] == "0"
+               for argv in job["command_argvs"])
+    wrong = dict(planned["request"]["points"][0], coordinate=0.0)
+    with pytest.raises(ValueError, match="original-grid point"):
+        condor_plan_backend().plan(dict(planned["request"], points=[wrong]), spec)
+
+
+def test_reference_intent_success_failure_and_dataset_reuse(campaign_inputs, monkeypatch):
+    source, data, root = campaign_inputs
+    data["grid"]["points"] = 7
+    data["dataset"] = {"mode": "expected", "truth": "sm", "producer_label": "blinded"}
+    source.write_text(yaml.safe_dump(data))
+    campaign_id = manager.create(root, source)["campaign_id"]
+    original = condor_plan_backend.prepare_reference
+    def failed(self, spec, argv, directory, output_path):
+        raise RuntimeError("synthetic reference failure")
+    monkeypatch.setattr(condor_plan_backend, "prepare_reference", failed)
+    with pytest.raises(RuntimeError, match="synthetic reference failure"):
+        manager.prepare_reference(root, campaign_id, "c_one:profiled", backend="condor")
+    assert not manager.status(root, campaign_id).get("references")
+    monkeypatch.setattr(condor_plan_backend, "prepare_reference", fake_prepare_reference)
+    ready = manager.prepare_reference(root, campaign_id, "c_one:profiled", backend="condor")["reference"]
+    assert "--saveFitResult" in ready["argv"]
+    assert ready["evidence"]["fit_result"]["sha256"]
+    assert ready["argv"] == reference_argv(manager.campaign_store(root, campaign_id).read()["campaign"]["effective_spec"],
+                                          manager.status(root, campaign_id)["points"][0],
+                                          ".campaign_reference_" + ready["reference_id"])
+    planned = manager.plan(root, campaign_id, backend="condor", dry_run=True)
+    job = planned["plan"]["jobs"][0]
+    assert len(job["expected_members"]) == 2
+    assert job["execution_provenance"]["shared_reference"]["artifact"] == ready["artifact"]
+    assert all("--toysFile" in argv and "--snapshotName" in argv and
+               "--skipInitialFit" in argv and "--setParameters" not in argv and
+               argv[argv.index("--points") + 1] == "7" for argv in job["command_argvs"])
+    tampered = dict(ready, scientific_contract=dict(ready["scientific_contract"],
+                   dataset={"mode": "observed", "name": "data_obs"}))
+    with pytest.raises(ValueError, match="scientific contract"):
+        condor_plan_backend().plan(dict(planned["request"], references={"c_one:profiled": tampered}),
+                                   manager.campaign_store(root, campaign_id).read()["campaign"]["effective_spec"])
+    monkeypatch.setattr(condor_plan_backend, "prepare_reference", original)
+
+
+def test_reference_interruption_is_not_ready(campaign_inputs, monkeypatch):
+    source, data, root = campaign_inputs
+    data["grid"]["points"] = 6
+    source.write_text(yaml.safe_dump(data))
+    campaign_id = manager.create(root, source)["campaign_id"]
+    def interrupt(self, spec, argv, directory, output_path):
+        raise KeyboardInterrupt("synthetic interruption")
+    monkeypatch.setattr(condor_plan_backend, "prepare_reference", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.prepare_reference(root, campaign_id, "c_one:profiled", backend="condor")
+    assert manager.status(root, campaign_id)["references"]["c_one:profiled"]["state"] == "intent"
+    with pytest.raises(ValueError, match="uncertain"):
+        manager.plan(root, campaign_id, backend="condor", dry_run=True)
+
+
+def test_frozen_legacy_spec_uses_maximal_spans(campaign_inputs):
+    source, _, root = campaign_inputs
+    spec, text = load_spec(source)
+    spec.pop("execution")
+    spec.pop("reference")
+    store = state.campaign_store(root, state.new_id())
+    store.create(spec, text, manager.planned_points(spec))
+    planned = manager.plan(root, store.campaign_id, backend="condor", dry_run=True)
+    manifest = planned["plan"]["jobs"][0]["execution_provenance"]
+    assert manifest["schema"] == 4 and len(manifest["expected_members"]) == 1
+    assert manifest["expected_members"][0]["first_point"] == 0
+    assert manifest["expected_members"][0]["last_point"] == 4
 
 from test_execution_provenance_contract import eftfitter
 
@@ -179,7 +360,7 @@ def campaign_cli():
 def concurrent_restart(root, campaign_id, revision, queue):
     output, errors = io.StringIO(), io.StringIO()
     with redirect_stdout(output), redirect_stderr(errors):
-        code = campaign_cli().main(["--root", str(root), "restart", campaign_id, "--expected-revision", str(revision)])
+        code = campaign_cli().main(["--root", str(root), "--json", "restart", campaign_id, "--expected-revision", str(revision)])
     queue.put(json.loads(output.getvalue())["active_generation_id"] if code == 0 else json.loads(errors.getvalue())["error"])
 
 
@@ -314,10 +495,15 @@ def test_simultaneous_restart_cas_and_no_overwrite(campaign_inputs, record_prope
     ([4], [(4, 4)]), ([1, 2, 3], [(1, 3)]), ([1, 3], [(1, 1), (3, 3)]),
 ])
 def test_direct_grid_exact_members_and_queue(campaign_inputs, eftfitter, indices, intervals,
+                                             monkeypatch,
                                               record_property):
-    source, _, root = campaign_inputs
+    source, data, root = campaign_inputs
+    data["reference"] = {"mode": "shared_snapshot"}
+    source.write_text(yaml.safe_dump(data))
+    monkeypatch.setattr(condor_plan_backend, "prepare_reference", fake_prepare_reference)
     created = manager.create(root, source)
     campaign_id = created["campaign_id"]
+    manager.prepare_reference(root, campaign_id, "c_one:profiled", backend="condor")
     planned = manager.plan(root, campaign_id, backend="condor", dry_run=True)
     request = planned["request"]
     snapshot = state.campaign_store(root, campaign_id).read()
@@ -327,10 +513,12 @@ def test_direct_grid_exact_members_and_queue(campaign_inputs, eftfitter, indices
     condor = condor_plan_backend().plan(partial_request, spec)["jobs"][0]
     local = local_plan_backend().plan(partial_request, spec)["jobs"][0]
     manifest = condor["execution_provenance"]
-    assert manifest == local["execution_provenance"]
-    assert manifest["schema"] == 4 and manifest["original_points"] == 5
+    assert {key: value for key, value in manifest.items() if key != "points_per_member"} == {
+        key: value for key, value in local["execution_provenance"].items()
+        if key != "points_per_member"}
+    assert manifest["schema"] == 5 and manifest["original_points"] == 5
     assert manifest["selected_indices"] == indices
-    assert eftfitter._validate_condor_provenance(manifest, condor["scan_name"]) == manifest
+    assert validate_direct_grid_provenance(manifest, condor["scan_name"]) == manifest
     assert [(m["first_point"], m["last_point"]) for m in manifest["expected_members"]] == intervals
     assert len(condor["condor"]["queue"]) == len(intervals)
     assert [item["member_index"] for item in condor["condor"]["queue"]] == list(range(len(intervals)))
@@ -540,16 +728,23 @@ def test_observed_default_name_freezes_without_changing_explicit_legacy_shape(ca
     ([1, 2, 3], [(1, 3)]), ([1, 3], [(1, 1), (3, 3)]),
 ])
 def test_yaml_original_index_subset_reaches_both_providers(campaign_inputs, indices,
+                                                                  monkeypatch,
                                                               intervals, record_property):
     source, data, root = campaign_inputs
     data["grid"]["selected_indices"] = list(reversed(indices))
+    data["reference"] = {"mode": "shared_snapshot"}
     source.write_text(yaml.safe_dump(data))
+    monkeypatch.setattr(condor_plan_backend, "prepare_reference", fake_prepare_reference)
     created = manager.create(root, source)
+    manager.prepare_reference(root, created["campaign_id"], "c_one:profiled", backend="condor")
     assert len(manager.status(root, created["campaign_id"])["points"]) == 5
     local = manager.plan(root, created["campaign_id"], backend="local", dry_run=True)
     condor = manager.plan(root, created["campaign_id"], backend="condor", dry_run=True)
     assert [p["point_index"] for p in local["request"]["points"]] == indices
-    assert local["plan"]["jobs"][0]["execution_provenance"] == condor["plan"]["jobs"][0]["execution_provenance"]
+    local_manifest = local["plan"]["jobs"][0]["execution_provenance"]
+    condor_manifest = condor["plan"]["jobs"][0]["execution_provenance"]
+    assert {key: value for key, value in local_manifest.items() if key != "points_per_member"} == {
+        key: value for key, value in condor_manifest.items() if key != "points_per_member"}
     job = condor["plan"]["jobs"][0]
     manifest = job["execution_provenance"]
     assert manifest["original_points"] == 5 and manifest["selected_indices"] == indices

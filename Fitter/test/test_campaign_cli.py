@@ -12,7 +12,7 @@ import pytest
 import uproot
 import yaml
 
-from test_campaign_manager import campaign_inputs, providers, eftfitter, snapshot_tree
+from test_campaign_manager import campaign_inputs, providers, eftfitter, snapshot_tree, fake_prepare_reference
 from python.campaign_backend import condor_plan_backend
 from python import campaign_backend
 from python import campaign_state as state
@@ -29,7 +29,7 @@ cli_spec.loader.exec_module(cli)
 def invoke(capsys, campaign_inputs, providers):
     _, _, root = campaign_inputs
     def run(*args, expected=0, backend_map=providers):
-        code = cli.main(["--root", str(root), *map(str, args)], backends=backend_map)
+        code = cli.main(["--root", str(root), "--json", *map(str, args)], backends=backend_map)
         captured = capsys.readouterr()
         assert code == expected, captured.err
         return json.loads(captured.out if code == 0 else captured.err)
@@ -108,7 +108,7 @@ def native_inputs(campaign_inputs, tmp_path, monkeypatch):
 def invoke_native(capsys, native_inputs):
     _, root, _, _ = native_inputs
     def run(*args, expected=0):
-        code = cli.main(["--root", str(root), *map(str, args)], backends=None)
+        code = cli.main(["--root", str(root), "--json", *map(str, args)], backends=None)
         captured = capsys.readouterr()
         assert code == expected, captured.err
         return json.loads(captured.out if code == 0 else captured.err)
@@ -144,7 +144,7 @@ def test_native_local_singleton_cli_and_009a_receipt(native_inputs, invoke_nativ
     manifest = read_json(receipt["references"][0]["resolved_path"])
     record = read_json(receipt["references"][1]["resolved_path"])
     worker_result = read_json(receipt["references"][2]["resolved_path"])
-    assert manifest["schema"] == 4 and manifest["selected_indices"] == [3]
+    assert manifest["schema"] == 5 and manifest["selected_indices"] == [3]
     assert record["attempt_id"] == "campaign_" + attempt_id
     assert record["member_set"] == manifest["expected_members"]
     assert worker_result["resolved_runtime"]["combine_executable"] == str(source.parent / "release" / "bin" / "synthetic_arch" / "combine")
@@ -380,13 +380,13 @@ def test_six_lifecycle_operations_mixed_backends_and_frozen_spec(campaign_inputs
     providers["provider_a"].cases["c_one:profiled"] = {1: "failed", 2: "duplicate", 3: "partial"}
     first, _ = run_attempt(invoke, campaign_id, "provider_a")
     observed = invoke("status", campaign_id)
-    assert [p["status"] for p in observed["points"]] == ["accepted", "invalid", "accepted", "unresolved", "accepted"]
+    assert [p["status"] for p in observed["points"]] == ["accepted", "invalid", "invalid", "unresolved", "accepted"]
     assert first["request"]["points"][1]["point_index"] == 1
     before_condor = snapshot_tree(root)
     condor_retry = invoke("retry", campaign_id, "--backend", "condor", "--dry-run",
                           backend_map={"condor": condor_plan_backend()})
-    assert condor_retry["plan"]["jobs"][0]["point_indices"] == [1, 3]
-    assert len(condor_retry["plan"]["jobs"][0]["condor"]["queue"]) == 2
+    assert condor_retry["plan"]["jobs"][0]["point_indices"] == [1, 2, 3]
+    assert len(condor_retry["plan"]["jobs"][0]["condor"]["queue"]) == 1
     assert snapshot_tree(root) == before_condor
     rescue = invoke("rescue", campaign_id, "--backend", "provider_b", "--strategy", "minimizer_strategy_1", "--dry-run")
     assert [p["point_index"] for p in rescue["request"]["points"]] == [1]
@@ -394,21 +394,21 @@ def test_six_lifecycle_operations_mixed_backends_and_frozen_spec(campaign_inputs
     assert "--cminDefaultMinimizerStrategy=1" in rescue["plan"]["jobs"][0]["argv"]
     source.write_text("changed: original YAML no longer controls this campaign\n")
     retry, recovered = run_attempt(invoke, campaign_id, "provider_b", "retry")
-    assert [p["point_index"] for p in retry["request"]["points"]] == [1, 3]
+    assert [p["point_index"] for p in retry["request"]["points"]] == [1, 2, 3]
     assert {r["reason"] for r in recovered["receipts"]} == {"PROMOTION_UNQUALIFIED_REFERENCE"}
     assert set(j["job_set_id"] for j in first["plan"]["jobs"]).isdisjoint(j["job_set_id"] for j in retry["plan"]["jobs"])
-    assert [job["point_indices"] for job in retry["plan"]["jobs"]] == [[1], [3]]
+    assert [job["point_indices"] for job in retry["plan"]["jobs"]] == [[1, 2, 3]]
     observed = invoke("status", campaign_id)
     assert observed["campaign_id"] == campaign_id
     assert observed["active_generation_id"] == initial["active_generation_id"]
     assert observed["spec_digest"] == initial["spec_digest"]
-    assert [p["status"] for p in observed["points"]] == ["accepted", "unresolved", "accepted", "unresolved", "accepted"]
+    assert [p["status"] for p in observed["points"]] == ["accepted", "unresolved", "unresolved", "unresolved", "accepted"]
     assert observed["attempts"][-1]["runtime"]["provider"] == "provider_b"
     before = snapshot_tree(root)
     assert invoke("retry", campaign_id, "--backend", "provider_b")["status"] == "no_eligible_points"
     rescue_after = invoke("rescue", campaign_id, "--backend", "provider_b", "--strategy", "minimizer_strategy_1")
     assert rescue_after["status"] == "no_eligible_points"
-    assert {p["reason"] for p in rescue_after["not_yet_recoverable"] if p["point_index"] in (1, 3)} == {"promotion_unqualified_reference"}
+    assert {p["reason"] for p in rescue_after["not_yet_recoverable"] if p["point_index"] in (1, 2, 3)} == {"promotion_unqualified_reference"}
     assert snapshot_tree(root) == before
     invoke("rescue", campaign_id, "--strategy", "unknown", expected=2)
     cloned = invoke("clone", campaign_id)
@@ -489,7 +489,8 @@ def test_dry_runs_read_only_for_every_mutation_and_status(campaign_inputs, provi
     manifest = next(root.rglob("execution_provenance.json"))
     manifest.write_text("corrupted")
     before = snapshot_tree(root)
-    assert all(p["status"] == "invalid" for p in invoke("status", campaign_id)["points"])
+    assert all(p["status"] == "accepted" and "evidence_issue" in p
+               for p in invoke("status", campaign_id)["points"])
     assert snapshot_tree(root) == before
 
 
@@ -532,10 +533,43 @@ def test_full_population_condor_planning_and_missing_provider(campaign_inputs, i
 def test_script_entrypoint_through_wrapper(campaign_inputs):
     source, _, root = campaign_inputs
     command = ["/users/apiccine/work/correction-lib/codex-run.sh", sys.executable, str(cli_path), "--root", str(root)]
-    result = subprocess.run(command + ["create", str(source)], text=True, capture_output=True, check=True)
+    result = subprocess.run(command + ["--json", "create", str(source)], text=True, capture_output=True, check=True)
     initial = json.loads(result.stdout)
-    result = subprocess.run(command + ["status", initial["campaign_id"]], text=True, capture_output=True, check=True)
+    result = subprocess.run(command + ["--json", "status", initial["campaign_id"]], text=True, capture_output=True, check=True)
     assert json.loads(result.stdout) == initial
+
+
+def test_default_cli_summarizes_plan_and_json_remains_explicit(campaign_inputs, capsys):
+    source, _, root = campaign_inputs
+    created = cli.manager.create(root, source)
+    campaign_id = created["campaign_id"]
+    assert cli.main(["--root", str(root), "plan", campaign_id, "--backend", "local", "--dry-run"]) == 0
+    readable = capsys.readouterr().out
+    assert "selected points: 5" in readable
+    assert "5 per member" not in readable and "all per member" in readable
+    assert "1 member" in readable and "next action:" in readable
+    assert cli.main(["--root", str(root), "--json", "plan", campaign_id,
+                     "--backend", "local", "--dry-run"]) == 0
+    machine = json.loads(capsys.readouterr().out)
+    assert machine["request"]["campaign_id"] == campaign_id
+
+
+def test_prepare_reference_cli_uses_injected_fake_provider(campaign_inputs, providers,
+                                                            invoke, monkeypatch, capsys):
+    source, data, root = campaign_inputs
+    data["grid"]["points"] = 7
+    source.write_text(yaml.safe_dump(data))
+    monkeypatch.setattr(condor_plan_backend, "prepare_reference", fake_prepare_reference)
+    campaign_id = invoke("create", source)["campaign_id"]
+    result = invoke("prepare-reference", campaign_id, "--scan-id", "c_one:profiled",
+                    "--backend", "provider_a")
+    assert result["state"] == "ready"
+    assert result["reference"]["runtime"]["synthetic"] is True
+    assert cli.main(["--root", str(root), "prepare-reference", campaign_id,
+                     "--scan-id", "c_one:profiled", "--backend", "provider_a"],
+                    backends=providers) == 0
+    readable = capsys.readouterr().out
+    assert "campaign: " + campaign_id in readable and "reference: already_ready" in readable
 
 
 def test_special_entry_is_not_grid_success_and_first_valid_recovery(campaign_inputs, providers, invoke):
@@ -577,8 +611,9 @@ def test_identity_owned_content_and_corruption_are_per_scan(campaign_inputs, pro
     path = next((root / campaign_id / "execution" / plan_a["request"]["attempt_id"]).rglob("*.root"))
     path.unlink()
     observed = invoke("status", campaign_id, backend_map={})
-    assert {p["status"] for p in observed["points"] if p["wc"] == "c_one"} == {"missing"}
+    assert {p["status"] for p in observed["points"] if p["wc"] == "c_one"} == {"accepted"}
+    assert all("evidence_issue" in p for p in observed["points"] if p["wc"] == "c_one")
     assert {p["status"] for p in observed["points"] if p["wc"] == "c_two"} == {"accepted"}
     retry = invoke("retry", campaign_id, "--backend", "provider_b", "--dry-run")
     assert retry["status"] == "no_eligible_points"
-    assert {p["reason"] for p in retry["not_yet_recoverable"] if p["scan_id"] == "c_one:profiled"} == {"canonical_reference_damaged"}
+    assert {p["reason"] for p in retry["not_yet_recoverable"] if p["scan_id"] == "c_one:profiled"} == {"accepted_valid_candidate"}
