@@ -11,6 +11,7 @@ from .execution_provenance import (file_identity, read_json, sha256_file,
                                    validate_direct_attempt_record, validate_execution_identity,
                                    validate_workspace_identity)
 from .scan_1d import read_scan
+from .wc_fit_config import load_fit_input_package
 
 
 def point_key(point):
@@ -71,6 +72,28 @@ def planning_eligibility(operation, points, attempts, receipts, generation_id):
 def verify_reference(reference):
     if sha256_file(reference["resolved_path"]) != reference["sha256"]:
         raise ValueError("referenced artifact changed: " + reference["resolved_path"])
+
+
+def verify_package(spec):
+    """Check the live package locator against frozen scientific configuration."""
+    frozen = spec["package"]
+    path = Path(frozen["resolved_path"])
+    before = file_identity(path)
+    package = load_fit_input_package(path.parent.parent)
+    if package.config_path.resolve() != path.resolve():
+        raise ValueError("package configuration locator changed")
+    config = package.fit_config
+    after = file_identity(path)
+    if before != after:
+        raise ValueError("package configuration changed during validation")
+    observed_config = {"analysis": config.analysis,
+                       "scientific_wcs": list(config.scientific_wcs),
+                       "fixed_wcs": list(config.fixed_wcs),
+                       "wc_ranges": {wc: list(bounds) for wc, bounds in config.wc_ranges.items()}}
+    if observed_config != spec["fit_config"]:
+        raise ValueError("package scientific configuration changed: " + str(path))
+    return {"frozen_sha256": frozen["sha256"], "observed_sha256": after["sha256"],
+            "byte_difference": after["sha256"] != frozen["sha256"]}
 
 
 def reference_state(snapshot):
@@ -276,6 +299,7 @@ def prepare_reference(root, campaign_id, scan_id, backend=None, dry_run=False, b
             raise ValueError("unknown or empty logical scan_id")
         if not reference_required(spec, provider.name, [p["point_index"] for p in scan_points]):
             raise ValueError("this scan does not require a shared reference")
+        package_input_check = verify_package(spec)
         pending, ready = reference_state(snapshot)
         if scan_id in pending:
             raise ValueError("reference completion uncertain; inspect the existing intent")
@@ -283,8 +307,8 @@ def prepare_reference(root, campaign_id, scan_id, backend=None, dry_run=False, b
             if ready[scan_id]["scientific_contract"] != reference_contract(spec, scan_points[0]):
                 raise ValueError("existing reference has a different scientific contract")
             verify_reference(ready[scan_id]["artifact"])
-            return {"operation": "prepare_reference", "state": "already_ready", "reference": ready[scan_id]}
-        verify_reference(spec["package"])
+            return {"operation": "prepare_reference", "state": "already_ready", "reference": ready[scan_id],
+                    "package_input_check": package_input_check}
         validate_workspace_identity(spec["workspace"])
         reference_id = "0" * 32 if dry_run else new_id()
         directory = store.path / "references" / reference_id
@@ -295,7 +319,8 @@ def prepare_reference(root, campaign_id, scan_id, backend=None, dry_run=False, b
         intent = {"scan_id": scan_id, "reference_id": reference_id,
                   "generation_id": active["generation_id"], "backend": provider.name,
                   "scientific_contract": reference_contract(spec, scan_points[0]),
-                  "argv": argv, "output_path": str(output_path)}
+                  "argv": argv, "output_path": str(output_path),
+                  "package_input_check": package_input_check}
         if dry_run:
             return {"operation": "prepare_reference", "dry_run": True, "intent": intent}
         snapshot = store.append(snapshot, "reference_intent", intent)
@@ -317,7 +342,8 @@ def prepare_reference(root, campaign_id, scan_id, backend=None, dry_run=False, b
                        "argv": argv, "evidence": {key: value for key, value in produced.items()
                                                   if key not in ("artifact", "runtime")}}
         store.append(snapshot, "reference_ready", ready_event)
-        return {"operation": "prepare_reference", "state": "ready", "reference": ready_event}
+        return {"operation": "prepare_reference", "state": "ready", "reference": ready_event,
+                "package_input_check": package_input_check}
     if dry_run:
         return transition()
     with store.locked():
@@ -357,7 +383,7 @@ def plan(root, campaign_id, operation="plan", backend=None, strategy=None, dry_r
                     "campaign_id": campaign_id, "generation_id": active["generation_id"],
                     "not_yet_recoverable": deferred}
         # Input identities are needed only by execution planning, never status/clone/restart.
-        verify_reference(spec["package"])
+        package_input_check = verify_package(spec)
         validate_workspace_identity(spec["workspace"])
         pending_references, ready_references = reference_state(snapshot)
         references = {}
@@ -377,7 +403,8 @@ def plan(root, campaign_id, operation="plan", backend=None, strategy=None, dry_r
                    "execution_root": str((store.path / "execution" / attempt_id).resolve()),
                    "operation": operation, "requested_backend": provider.name, "points": points,
                    "references": references,
-                   "strategy": strategy, "numerical_difference": ({"--cminDefaultMinimizerStrategy": {"before": 0, "after": 1}} if strategy else {})}
+                   "strategy": strategy, "numerical_difference": ({"--cminDefaultMinimizerStrategy": {"before": 0, "after": 1}} if strategy else {}),
+                   "package_input_check": package_input_check}
         mapped = provider.plan(request, spec)
         if mapped["actual_backend"] != provider.name or mapped["requested_backend"] != provider.name:
             raise ValueError("provider substitution is forbidden")
@@ -420,11 +447,12 @@ def dispatch(root, campaign_id, attempt_id, dry_run=False, backends=None):
         if dry_run:
             return {"operation": "dispatch", "dry_run": True, "attempt_id": attempt_id}
         spec = snapshot["campaign"]["effective_spec"]
-        verify_reference(spec["package"])
+        package_input_check = verify_package(spec)
         validate_workspace_identity(spec["workspace"])
         # Write intent BEFORE calling a provider: interruption is never resubmitted.
         snapshot = store.append(snapshot, "dispatch", {"attempt_id": attempt_id,
-                              "runtime": provider.runtime(spec), "state": "intent"})
+                              "runtime": provider.runtime(spec), "state": "intent",
+                              "package_input_check": package_input_check})
         attempt = active_attempt(snapshot, attempt_id)
         try:
             if recover:

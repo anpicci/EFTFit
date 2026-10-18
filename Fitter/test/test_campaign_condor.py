@@ -17,6 +17,7 @@ from python.campaign_backend import condor_plan_backend, local_plan_backend
 from python.campaign_spec import digest, load_spec
 from python.campaign_state import campaign_store
 from python.execution_provenance import read_json, sha256_file, write_json_exclusive
+from python.scan_1d import read_scan, combine_scans
 
 real_submit_job = campaign_condor.submit_job
 real_query_job = campaign_condor.query_job
@@ -623,8 +624,14 @@ def test_shared_reference_collects_distinct_owned_members(condor_case):
             tree = output.mktree("limit", {"ctG": "float32", "deltaNLL": "float32",
                                             "quantileExpected": "float32"})
             tree.extend({"ctG": np.array([point["coordinate"]], dtype="f4"),
-                         "deltaNLL": np.array([float(point["point_index"])], dtype="f4"),
+                         "deltaNLL": np.array([101.0 if member["member_index"] == 0 else 303.0], dtype="f4"),
                          "quantileExpected": np.array([0], dtype="f4")})
+    member_paths = [Path(job["execution_provenance"]["execution_directory"]) / member["file_name"]
+                    for member in job["expected_members"]]
+    scans = [read_scan(path, "ctG", failed_point_policy="mask", family="scan_1d_profiled")
+             for path in member_paths]
+    assert [scan.raw_entries[0].delta_nll for scan in scans] == [101.0, 303.0]
+    assert [point.twice_delta_nll for point in combine_scans(scans, common_reference=True).grid_points] == [0.0, 404.0]
     receipts = invoke("collect", campaign_id, attempt_id)["receipts"]
     assert [(item["point_index"], item["status"]) for item in receipts] == [(1, "accepted"), (3, "accepted")]
     assert receipts[0]["reference_group"] == receipts[1]["reference_group"]

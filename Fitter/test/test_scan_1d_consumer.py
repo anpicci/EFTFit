@@ -348,4 +348,4 @@ def test_retrieval_api_signatures_remain():
     tree = ast.parse((fitter_dir / "scripts" / "EFTFitter.py").read_text())
     methods = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
     assert [arg.arg for arg in methods["batchRetrieve1DScansEFT"].args.args] == ["self", "basename", "batch", "scan_wcs", "job_set_ids"]
-    assert [arg.arg for arg in methods["retrieveGridScan"].args.args] == ["self", "name", "batch", "user", "require_condor_provenance", "job_set_id"]
+    assert [arg.arg for arg in methods["retrieveGridScan"].args.args] == ["self", "name", "batch", "user", "require_condor_provenance", "job_set_id", "execution_root"]

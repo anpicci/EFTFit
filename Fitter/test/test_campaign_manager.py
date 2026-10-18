@@ -145,6 +145,74 @@ def test_centered_global_grid_survives_five_point_members(campaign_inputs, monke
         condor_plan_backend().plan(dict(planned["request"], points=[wrong]), spec)
 
 
+def test_package_comment_preserves_frozen_science_and_records_byte_drift(
+        campaign_inputs, providers, monkeypatch):
+    source, data, root = campaign_inputs
+    data["reference"] = {"mode": "shared_snapshot"}
+    source.write_text(yaml.safe_dump(data))
+    campaign_id = manager.create(root, source)["campaign_id"]
+    frozen = state.campaign_store(root, campaign_id).read()["campaign"]["effective_spec"]
+    config_path = Path(frozen["package"]["resolved_path"])
+    config_path.write_text(config_path.read_text() + "# presentation-only comment\n")
+    monkeypatch.setattr(condor_plan_backend, "prepare_reference", fake_prepare_reference)
+    prepared = manager.prepare_reference(root, campaign_id, "c_one:profiled",
+                                         backend="provider_a", backends=providers)
+    assert prepared["package_input_check"] == {
+        "frozen_sha256": frozen["package"]["sha256"],
+        "observed_sha256": sha256_file(config_path), "byte_difference": True}
+    assert manager.prepare_reference(root, campaign_id, "c_one:profiled",
+                                     backend="provider_a", backends=providers)["state"] == "already_ready"
+    planned = manager.plan(root, campaign_id, backend="provider_a", backends=providers)
+    assert planned["request"]["package_input_check"] == prepared["package_input_check"]
+    assert state.campaign_store(root, campaign_id).read()["campaign"]["effective_spec"] == frozen
+    monkeypatch.setattr(providers["provider_a"], "dispatch", lambda *args: None)
+    manager.dispatch(root, campaign_id, planned["request"]["attempt_id"], backends=providers)
+    snapshot = state.campaign_store(root, campaign_id).read()
+    assert manager.current_state(snapshot)[2][planned["request"]["attempt_id"]]["dispatch"]["package_input_check"] == prepared["package_input_check"]
+
+
+def test_package_science_or_missing_input_blocks_new_execution(campaign_inputs, providers):
+    source, _, root = campaign_inputs
+    campaign_id = manager.create(root, source)["campaign_id"]
+    planned = manager.plan(root, campaign_id, backend="provider_a", backends=providers)
+    config_path = Path(yaml.safe_load(source.read_text())["package"]["path"]) / "config" / "TOP_26_006.yml"
+    original = config_path.read_text()
+    changed = yaml.safe_load(original)
+    changed["wc_ranges"]["c_two"] = [-3, 3]
+    config_path.write_text(yaml.safe_dump(changed))
+    with pytest.raises(ValueError, match="scientific configuration changed"):
+        manager.plan(root, campaign_id, backend="provider_a", dry_run=True, backends=providers)
+    with pytest.raises(ValueError, match="scientific configuration changed"):
+        manager.dispatch(root, campaign_id, planned["request"]["attempt_id"], backends=providers)
+    assert manager.current_state(state.campaign_store(root, campaign_id).read())[2][planned["request"]["attempt_id"]]["dispatch"] is None
+    config_path.unlink()
+    with pytest.raises((OSError, RuntimeError, ValueError)):
+        manager.plan(root, campaign_id, backend="provider_a", dry_run=True, backends=providers)
+    config_path.write_text(original)
+    workspace = Path(yaml.safe_load(source.read_text())["workspace"]["path"])
+    workspace.write_bytes(b"changed workspace")
+    with pytest.raises(RuntimeError, match="Workspace content identity mismatch"):
+        manager.plan(root, campaign_id, backend="provider_a", dry_run=True, backends=providers)
+
+
+def test_expected_sm_zero_must_fit_every_scientific_range(campaign_inputs):
+    source, data, root = campaign_inputs
+    config_path = Path(data["package"]["path"]) / "config" / "TOP_26_006.yml"
+    config = yaml.safe_load(config_path.read_text())
+    config["wc_ranges"]["c_two"] = [1, 2]  # Not the selected scan axis.
+    config_path.write_text(yaml.safe_dump(config))
+    data["package"]["sha256"] = sha256_file(config_path)
+    data["dataset"] = {"mode": "expected", "truth": "sm"}
+    source.write_text(yaml.safe_dump(data))
+    with pytest.raises(ValueError, match="expected SM truth WC c_two=0"):
+        manager.create(root, source)
+    assert not root.exists()
+    data["dataset"] = {"mode": "observed", "name": "data_obs"}
+    source.write_text(yaml.safe_dump(data))
+    spec, _ = load_spec(source)
+    assert spec["fit_config"]["wc_ranges"]["c_two"] == [1, 2]
+
+
 def test_reference_intent_success_failure_and_dataset_reuse(campaign_inputs, monkeypatch):
     source, data, root = campaign_inputs
     data["grid"]["points"] = 7
@@ -640,6 +708,14 @@ def test_direct_grid_member_receipt_uses_009a_attempt(campaign_inputs, eftfitter
         manager.validate_member(attempt, dict(link, point_indices=[1]), mapping, spec)
     with pytest.raises(ValueError, match="incomplete"):
         manager.validate_member(attempt, link, dict(mapping, point_indices=[0]), spec)
+    with uproot.recreate(path) as output:
+        tree = output.mktree("limit", {"c_one": "float32", "deltaNLL": "float32",
+                                       "quantileExpected": "float32"})
+        tree.extend({"c_one": np.array([p["coordinate"] for p in points] + [0.37], dtype="f4"),
+                     "deltaNLL": np.array(list(range(5)) + [7], dtype="f4"),
+                     "quantileExpected": np.zeros(6, dtype="f4")})
+    with pytest.raises(ValueError, match="physical row has no unique owned original-grid coordinate"):
+        manager.validate_member(attempt, link, mapping, spec)
 
 
 def test_condor_path_limit_does_not_poison_local_or_status(campaign_inputs):

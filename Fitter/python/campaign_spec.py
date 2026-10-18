@@ -84,6 +84,10 @@ def load_spec(path):
             raise ValueError("expected generation truth currently supports only sm")
         if dataset.get("nuisance_generation", "nominal") != "nominal":
             raise ValueError("frequentist nuisance generation requires verified source data and is unqualified")
+        for wc in config.scientific_wcs:
+            lower, upper = config.wc_ranges[wc]
+            if not lower <= 0 <= upper:
+                raise ValueError("expected SM truth WC {}=0 is outside configured range".format(wc))
         effective_dataset = dict(dataset, nuisance_generation="nominal")
     if "producer_label" in dataset and dataset["producer_label"] not in ("blinded", "unblinded"):
         raise ValueError("dataset.producer_label must be blinded or unblinded")

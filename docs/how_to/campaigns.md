@@ -47,9 +47,13 @@ backend: condor       # optional default for new execution plans
 keep_failures: false
 ```
 
-Paths resolve relative to the YAML. `package.sha256` binds the scientific
-configuration, not every datacard: this frontend consumes the separately hashed
-workspace and the package configuration. It neither builds nor certifies that
+Paths resolve relative to the YAML. At creation, `package.sha256` identifies
+the package configuration bytes, not every datacard. Reference preparation,
+planning, and dispatch reread that configuration and compare its parsed scientific
+fields with the frozen effective spec. Comment or formatting changes retain the
+original and observed hashes in technical provenance; a scientific change or
+missing package input blocks new execution. The workspace keeps an exact byte
+identity check. This frontend neither builds nor certifies that
 workspace. The observed dataset name is a workspace object name; external
 `file:dataset` selectors are unsupported because their bytes would require an
 additional identity contract. Dataset presence and workspace scientific
@@ -97,8 +101,10 @@ Legacy effective specs without `reference` retain independent-fit semantics.
 `producer_label`, `observed`, and `data_obs` alone do not prove the contents of
 a stored dataset. A blinded stored Asimov and a runtime-generated Asimov are
 different constructions. The generation truth, minimizer start and fitted
-snapshot are distinct. This shared reference is scoped to parallel 1D scans;
-it does not impose a global prerequisite on ordinary inference or impacts.
+snapshot are distinct. Expected-SM generation requires zero inside every
+scientific WC range, including WCs outside the selected scan axis. Observed
+scans retain their declared ranges. This shared reference is scoped to parallel
+1D scans; it does not impose a global prerequisite on ordinary inference or impacts.
 The partition helper accepts effective original indices, including a
 producer's nontrivial effective grid cardinality, but the native campaign
 adapter and physical-row reader here remain 1D. Multidimensional campaigns
@@ -189,8 +195,9 @@ that new specification; existing campaign inspection remains usable.
 
 Creation freezes the effective configuration and its digest, package/workspace
 identities, and original YAML text. Later source YAML edits do not change it.
-Package/workspace bytes are checked again for execution plans and dispatch;
-status, restart and clone can operate when those external inputs are absent.
+Package scientific fields and workspace bytes are checked again for execution
+plans and dispatch; status, restart and clone can operate when those external
+inputs are absent.
 
 ## Commands
 

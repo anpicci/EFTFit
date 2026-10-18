@@ -15,6 +15,7 @@ import yaml
 from test_campaign_manager import campaign_inputs, providers, eftfitter, snapshot_tree, fake_prepare_reference
 from python.campaign_backend import condor_plan_backend
 from python import campaign_backend
+from python import campaign_manager as manager
 from python import campaign_state as state
 from python.campaign_spec import load_spec, planned_points
 from python.execution_provenance import read_json, sha256_file
@@ -291,6 +292,31 @@ def test_native_local_rejects_foreign_combine_before_execution(native_inputs, in
     assert result.get("resolved_runtime") is None
     assert "configured release" in Path(result["stderr"]).read_text()
     assert receipt["status"] == "invalid" and receipt["reference_group"] is None
+
+
+def test_local_worker_rechecks_shared_input_between_members(native_inputs, monkeypatch):
+    source, root, _, _ = native_inputs
+    data = yaml.safe_load(source.read_text())
+    data["grid"]["selected_indices"] = [1, 3]
+    data["execution"] = {"points_per_member": 1}
+    source.write_text(yaml.safe_dump(data))
+    monkeypatch.setattr(condor_plan_backend, "prepare_reference", fake_prepare_reference)
+    campaign_id = manager.create(root, source)["campaign_id"]
+    ready = manager.prepare_reference(root, campaign_id, "ctG:profiled", backend="local")
+    planned = manager.plan(root, campaign_id, backend="local")
+    assert len(planned["plan"]["jobs"][0]["expected_members"]) == 2
+    shared_reference = Path(ready["reference"]["artifact"]["resolved_path"])
+    real_run = campaign_backend.subprocess.run
+    launches = []
+    def mutate_after_first_worker(*args, **kwargs):
+        result = real_run(*args, **kwargs)
+        launches.append(args[0])
+        shared_reference.write_bytes(b"changed after first member")
+        return result
+    monkeypatch.setattr(campaign_backend.subprocess, "run", mutate_after_first_worker)
+    with pytest.raises(ValueError, match="local workspace/reference changed after planning"):
+        manager.dispatch(root, campaign_id, planned["request"]["attempt_id"])
+    assert len(launches) == 1
 
 
 def test_native_local_publication_error_after_zero_exit(native_inputs, invoke_native, monkeypatch):
